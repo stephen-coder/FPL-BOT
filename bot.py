@@ -161,11 +161,13 @@ def get_fpl_squad_message():
 # ==========================================
 @bot.message_handler(commands=["start", "help"])
 def send_welcome(message):
-    bot.reply_to(
-        message,
-        "⚽ *FPL Bot Ready!*\n\nSend /squad or /info anytime to generate the current optimal 15-player squad.",
-        parse_mode="Markdown",
+    welcome_text = (
+        "⚽ *FPL Assistant Bot Ready!*\n\n"
+        "Available Commands:\n"
+        "• /squad or /info - Generate optimal 15-player squad (£100m budget)\n"
+        "• /captain - Get top 3 captain candidates by Expected Points (xP)"
     )
+    bot.reply_to(message, welcome_text, parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["squad", "info"])
@@ -177,6 +179,48 @@ def send_squad(message):
     except Exception as e:
         bot.send_message(
             message.chat.id, f"⚠️ Error calculating squad: {str(e)}"
+        )
+
+
+@bot.message_handler(commands=["captain"])
+def send_captain(message):
+    bot.reply_to(message, "⏳ Fetching captain recommendations...")
+    try:
+        response = requests.get(FPL_BOOTSTRAP_URL, timeout=10)
+        data = response.json()
+
+        teams = {t["id"]: t["short_name"] for t in data.get("teams", [])}
+        players = []
+
+        for p in data.get("elements", []):
+            if p.get("ep_next") is not None:
+                try:
+                    players.append(
+                        {
+                            "name": p["web_name"],
+                            "team": teams.get(p["team"], "UNK"),
+                            "ep": float(p["ep_next"]),
+                        }
+                    )
+                except ValueError:
+                    continue
+
+        top_3 = sorted(players, key=lambda x: x["ep"], reverse=True)[:3]
+
+        if not top_3:
+            bot.send_message(
+                message.chat.id, "Could not retrieve captain data."
+            )
+            return
+
+        msg = "👑 *Top 3 Captain Candidates (Expected Points):*\n\n"
+        for idx, p in enumerate(top_3, start=1):
+            msg += f"{idx}. *{p['name']}* ({p['team']}) — *{p['ep']:.1f} xP*\n"
+
+        bot.send_message(message.chat.id, msg, parse_mode="Markdown")
+    except Exception as e:
+        bot.send_message(
+            message.chat.id, f"⚠️ Error fetching captain data: {str(e)}"
         )
 
 
