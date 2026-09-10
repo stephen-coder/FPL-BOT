@@ -1,237 +1,438 @@
-import datetime
 import os
-import threading
-import pandas as pd
 import pulp
 import requests
-import telebot
-from flask import Flask
-
-# ==========================================
-# CONFIGURATION
-# ==========================================
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN", "7999571480:AAHLu28JqoZy8vyO90iDoFMtFlhvAYun5Ng"
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
 )
-FPL_BOOTSTRAP_URL = "https://fantasy.premierleague.com/api/bootstrap-static/"
-POSITION_MAP = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
 
-# Initialize Bot & Web Server
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
-app = Flask(__name__)
+# --- FPL DATA FETCHERS ---
+
+FPL_BASE_URL = "https://fantasy.premierleague.com/api/"
 
 
-# Keep-Alive Web Endpoint for Render
-@app.route("/")
-def health_check():
-    return "FPL Bot is live and running 24/7!", 200
+def get_fpl_bootstrap():
+    """Fetches core database metrics from the official FPL API."""
+    url = f"{FPL_BASE_URL}bootstrap-static/"
+    res = requests.get(url)
+    res.raise_for_status()
+    return res.json()
 
 
-def run_web_server():
-    port = int(os.getenv("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+def get_next_gw(data):
+    """Finds the upcoming active Gameweek ID."""
+    for gw in data["events"]:
+        if gw["is_next"]:
+            return gw["id"]
+    return 1
 
 
-# ==========================================
-# SQUAD OPTIMIZATION LOGIC
-# ==========================================
-def get_fpl_squad_message():
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/115.0.0.0 Safari/537.36"
-        )
-    }
-    response = requests.get(FPL_BOOTSTRAP_URL, headers=headers)
-    data = response.json()
+def fetch_user_squad(team_id):
+    """Pulls a user's current 15-man squad and remaining bank balance."""
+    data = get_fpl_bootstrap()
+    next_gw = get_next_gw(data)
+    prev_gw = max(1, next_gw - 1)
 
-    events = data["events"]
-    next_event = next((e for e in events if e.get("is_next")), None)
-    if not next_event:
-        return "No upcoming Gameweek deadline found."
+    url = f"{FPL_BASE_URL}entry/{team_id}/event/{prev_gw}/picks/"
+    res = requests.get(url)
+    if res.status_code != 200:
+        return None, 0.0, next_gw
 
-    gw_name = next_event["name"]
-    deadline_dt = datetime.datetime.fromisoformat(
-        next_event["deadline_time"].replace("Z", "+00:00")
-    )
+    picks_data = res.json()
+    picks = [p["element"] for p in picks_data["picks"]]
+    bank = picks_data.get("entry_history", {}).get("bank", 0) / 10.0
 
-    df = pd.DataFrame(data["elements"])
-    df["now_cost"] = df["now_cost"] / 10.0
-    df["ep_next"] = pd.to_numeric(df["ep_next"], errors="coerce").fillna(0.0)
-    df["position"] = df["element_type"].map(POSITION_MAP)
+    types = {t["id"]: t["singular_name_short"] for t in data["element_types"]}
+    players_by_id = {p["id"]: p for p in data["elements"]}
 
-    # PuLP Optimization Model
-    prob = pulp.LpProblem("FPL_Optimization", pulp.LpMaximize)
-    player_vars = pulp.LpVariable.dicts("Player", df.index, cat="Binary")
-
-    prob += (
-        pulp.lpSum([player_vars[i] * df.loc[i, "ep_next"] for i in df.index]),
-        "Total_xP",
-    )
-    prob += (
-        pulp.lpSum([player_vars[i] * df.loc[i, "now_cost"] for i in df.index])
-        <= 100.0,
-        "Budget",
-    )
-    prob += pulp.lpSum([player_vars[i] for i in df.index]) == 15, "Total_Players"
-
-    prob += (
-        pulp.lpSum(
-            [
-                player_vars[i]
-                for i in df.index
-                if df.loc[i, "position"] == "GKP"
-            ]
-        )
-        == 2,
-        "GKP",
-    )
-    prob += (
-        pulp.lpSum(
-            [
-                player_vars[i]
-                for i in df.index
-                if df.loc[i, "position"] == "DEF"
-            ]
-        )
-        == 5,
-        "DEF",
-    )
-    prob += (
-        pulp.lpSum(
-            [
-                player_vars[i]
-                for i in df.index
-                if df.loc[i, "position"] == "MID"
-            ]
-        )
-        == 5,
-        "MID",
-    )
-    prob += (
-        pulp.lpSum(
-            [
-                player_vars[i]
-                for i in df.index
-                if df.loc[i, "position"] == "FWD"
-            ]
-        )
-        == 3,
-        "FWD",
-    )
-
-    for team_id in df["team"].unique():
-        prob += (
-            pulp.lpSum(
-                [
-                    player_vars[i]
-                    for i in df.index
-                    if df.loc[i, "team"] == team_id
-                ]
+    squad = []
+    for pid in picks:
+        if pid in players_by_id:
+            p = players_by_id[pid]
+            squad.append(
+                {
+                    "id": p["id"],
+                    "name": p["web_name"],
+                    "pos": types[p["element_type"]],
+                    "pos_id": p["element_type"],
+                    "ep_next": (
+                        float(p["ep_next"]) if p["ep_next"] is not None else 0.0
+                    ),
+                    "cost": p["now_cost"] / 10.0,
+                    "team": p["team"],
+                }
             )
-            <= 3,
-            f"Team_{team_id}",
+    return squad, bank, next_gw
+
+
+# --- PULP OPTIMIZATION ENGINES ---
+
+
+def solve_starting_xi(squad):
+    """Solves for Starting 11, Captain (C), Vice Captain (VC), and Bench order."""
+    prob = pulp.LpProblem("Lineup_Opt", pulp.LpMaximize)
+
+    start_vars = {
+        p["id"]: pulp.LpVariable(f"start_{p['id']}", cat="Binary")
+        for p in squad
+    }
+    cap_vars = {
+        p["id"]: pulp.LpVariable(f"cap_{p['id']}", cat="Binary") for p in squad
+    }
+
+    prob += pulp.lpSum(
+        [p["ep_next"] * start_vars[p["id"]] for p in squad]
+    ) + pulp.lpSum([p["ep_next"] * cap_vars[p["id"]] for p in squad])
+
+    prob += (
+        pulp.lpSum([start_vars[p["id"]] for p in squad]) == 11
+    ), "Exactly_11_Starters"
+    prob += (
+        pulp.lpSum([cap_vars[p["id"]] for p in squad]) == 1
+    ), "Exactly_1_Captain"
+
+    for p in squad:
+        prob += cap_vars[p["id"]] <= start_vars[p["id"]]
+
+    gkps = [p for p in squad if p["pos"] == "GKP"]
+    defs = [p for p in squad if p["pos"] == "DEF"]
+    mids = [p for p in squad if p["pos"] == "MID"]
+    fwds = [p for p in squad if p["pos"] == "FWD"]
+
+    prob += pulp.lpSum([start_vars[p["id"]] for p in gkps]) == 1
+    prob += pulp.lpSum([start_vars[p["id"]] for p in defs]) >= 3
+    prob += pulp.lpSum([start_vars[p["id"]] for p in defs]) <= 5
+    prob += pulp.lpSum([start_vars[p["id"]] for p in mids]) >= 2
+    prob += pulp.lpSum([start_vars[p["id"]] for p in mids]) <= 5
+    prob += pulp.lpSum([start_vars[p["id"]] for p in fwds]) >= 1
+    prob += pulp.lpSum([start_vars[p["id"]] for p in fwds]) <= 3
+
+    prob.solve(pulp.PULP_CBC_CMD(msg=0))
+
+    starters, bench = [], []
+    for p in squad:
+        p["is_captain"] = pulp.value(cap_vars[p["id"]]) == 1
+        if pulp.value(start_vars[p["id"]]) == 1:
+            starters.append(p)
+        else:
+            bench.append(p)
+
+    bench_gkp = [p for p in bench if p["pos"] == "GKP"]
+    bench_outfield = sorted(
+        [p for p in bench if p["pos"] != "GKP"],
+        key=lambda x: x["ep_next"],
+        reverse=True,
+    )
+
+    non_cap_starters = sorted(
+        [p for p in starters if not p["is_captain"]],
+        key=lambda x: x["ep_next"],
+        reverse=True,
+    )
+    vc_id = non_cap_starters[0]["id"] if non_cap_starters else None
+    for p in starters:
+        p["is_vice"] = p["id"] == vc_id
+
+    return starters, bench_gkp + bench_outfield
+
+
+def solve_transfers(squad, bank, num_transfers=1):
+    """Calculates optimal 1 or 2 player swaps based on budget and xP gain."""
+    data = get_fpl_bootstrap()
+    types = {t["id"]: t["singular_name_short"] for t in data["element_types"]}
+
+    current_ids = {p["id"] for p in squad}
+    candidates = []
+    for p in data["elements"]:
+        if p["status"] == "a" and float(p["ep_next"] or 0) > 0:
+            candidates.append(
+                {
+                    "id": p["id"],
+                    "name": p["web_name"],
+                    "pos": types[p["element_type"]],
+                    "pos_id": p["element_type"],
+                    "cost": p["now_cost"] / 10.0,
+                    "team": p["team"],
+                    "ep_next": float(p["ep_next"] or 0),
+                }
+            )
+
+    swaps = []
+    current_squad_ids = set(current_ids)
+    bank_balance = bank
+    total_gain = 0.0
+
+    sorted_squad = sorted(squad, key=lambda x: x["ep_next"])
+
+    for out_p in sorted_squad:
+        if len(swaps) >= num_transfers:
+            break
+
+        pos_id = out_p["pos_id"]
+        out_cost = out_p["cost"]
+        out_ep = out_p["ep_next"]
+        max_budget = out_cost + bank_balance
+
+        eligible_targets = [
+            p
+            for p in candidates
+            if p["pos_id"] == pos_id
+            and p["id"] not in current_squad_ids
+            and p["cost"] <= max_budget
+        ]
+
+        if not eligible_targets:
+            continue
+
+        best_target = max(eligible_targets, key=lambda p: p["ep_next"])
+        gain = best_target["ep_next"] - out_ep
+
+        if gain > 0.5:
+            bank_balance += out_cost - best_target["cost"]
+            total_gain += gain
+            swaps.append((out_p, best_target, gain))
+            current_squad_ids.remove(out_p["id"])
+            current_squad_ids.add(best_target["id"])
+
+    return swaps, bank_balance, total_gain
+
+
+def solve_chip_squad(horizon_gws=1):
+    """Calculates best 15-man squad for Free Hit (1 GW) or Wildcard (5-10 GWs)."""
+    data = get_fpl_bootstrap()
+    types = {t["id"]: t["singular_name_short"] for t in data["element_types"]}
+
+    players = []
+    for p in data["elements"]:
+        single_xp = float(p["ep_next"]) if p["ep_next"] is not None else 0.0
+        form_xp = float(p["form"]) if p["form"] is not None else 0.0
+
+        score = (
+            single_xp
+            if horizon_gws == 1
+            else (single_xp * 0.5 + form_xp * 0.5) * horizon_gws
         )
 
-    prob.solve(pulp.PULP_CBC_CMD(msg=False))
-    optimal_squad = df.loc[
-        [i for i in df.index if pulp.value(player_vars[i]) == 1]
-    ]
+        players.append(
+            {
+                "id": p["id"],
+                "name": p["web_name"],
+                "pos": types[p["element_type"]],
+                "cost": p["now_cost"] / 10.0,
+                "team": p["team"],
+                "xp": round(score, 1),
+            }
+        )
 
-    msg = f"🚨 *FPL DEADLINE ALERT: {gw_name}* 🚨\n"
-    msg += f"⏰ *Deadline:* {deadline_dt.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-    msg += "📋 *Optimal 15-Player Squad (£100m Budget):*\n"
+    prob = pulp.LpProblem("Chip_Opt", pulp.LpMaximize)
+    vars = {
+        p["id"]: pulp.LpVariable(f"p_{p['id']}", cat="Binary") for p in players
+    }
+
+    prob += pulp.lpSum([p["xp"] * vars[p["id"]] for p in players])
+    prob += pulp.lpSum([p["cost"] * vars[p["id"]] for p in players]) <= 100.0
+    prob += pulp.lpSum([vars[p["id"]] for p in players]) == 15
+
+    prob += (
+        pulp.lpSum([vars[p["id"]] for p in players if p["pos"] == "GKP"]) == 2
+    )
+    prob += (
+        pulp.lpSum([vars[p["id"]] for p in players if p["pos"] == "DEF"]) == 5
+    )
+    prob += (
+        pulp.lpSum([vars[p["id"]] for p in players if p["pos"] == "MID"]) == 5
+    )
+    prob += (
+        pulp.lpSum([vars[p["id"]] for p in players if p["pos"] == "FWD"]) == 3
+    )
+
+    for team_id in range(1, 21):
+        prob += (
+            pulp.lpSum([vars[p["id"]] for p in players if p["team"] == team_id])
+            <= 3
+        )
+
+    prob.solve(pulp.PULP_CBC_CMD(msg=0))
+    return [p for p in players if pulp.value(vars[p["id"]]) == 1]
+
+
+# --- TELEGRAM COMMAND HANDLERS ---
+
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "🤖 *FPL Assistant Bot Online*\n\n"
+        "Available commands:\n"
+        "• `/setteam <ID>` — Link your FPL Team ID\n"
+        "• `/squad` — Calculate optimal Starting XI, Captain & Bench\n"
+        "• `/transfers [1 or 2]` — Optimal transfer recommendations\n"
+        "• `/freehit` — Maximum 1-GW Free Hit squad\n"
+        "• `/wildcard` — Multi-GW Wildcard squad (5-10 GW horizon)\n"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def setteam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Usage: `/setteam <Your_FPL_ID>`", parse_mode="Markdown"
+        )
+        return
+
+    team_id = context.args[0]
+    context.user_data["team_id"] = team_id
+    await update.message.reply_text(
+        f"✅ FPL Team ID linked: *{team_id}*", parse_mode="Markdown"
+    )
+
+
+async def squad_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    team_id = context.user_data.get("team_id")
+    if not team_id:
+        await update.message.reply_text(
+            "⚠️ Link your team first using `/setteam <ID>`."
+        )
+        return
+
+    await update.message.reply_text(
+        "🔄 Optimizing your starting XI and bench order..."
+    )
+    squad, _, next_gw = fetch_user_squad(team_id)
+
+    if not squad:
+        await update.message.reply_text(
+            "❌ Unable to fetch squad. Check your FPL Team ID."
+        )
+        return
+
+    starters, bench = solve_starting_xi(squad)
+    total_xp = sum(p["ep_next"] for p in starters) + sum(
+        p["ep_next"] for p in starters if p.get("is_captain")
+    )
+
+    msg = f"📋 *GW{next_gw} Optimal Lineup* (Team: {team_id})\n"
+    msg += f"📊 *Projected Starting Score:* {total_xp:.1f} xP\n\n🟢 *STARTING XI*\n"
+
+    for p in starters:
+        role = ""
+        if p.get("is_captain"):
+            role = " *(C)*"
+        elif p.get("is_vice"):
+            role = " *(VC)*"
+        msg += f"• [{p['pos']}] *{p['name']}*{role} — {p['ep_next']} xP\n"
+
+    msg += "\n🪑 *BENCH ROTATION ORDER*\n"
+    for idx, p in enumerate(bench, 1):
+        msg += f"{idx}. [{p['pos']}] {p['name']} — {p['ep_next']} xP\n"
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def transfers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    team_id = context.user_data.get("team_id")
+    if not team_id:
+        await update.message.reply_text(
+            "⚠️ Link your team first using `/setteam <ID>`."
+        )
+        return
+
+    num_transfers = 1
+    if context.args:
+        try:
+            num_transfers = min(max(int(context.args[0]), 1), 2)
+        except ValueError:
+            num_transfers = 1
+
+    await update.message.reply_text(
+        f"⏳ Analyzing top {num_transfers} transfer recommendation(s)..."
+    )
+
+    squad, bank, next_gw = fetch_user_squad(team_id)
+    if not squad:
+        await update.message.reply_text(
+            "❌ Unable to fetch squad. Check your FPL Team ID."
+        )
+        return
+
+    swaps, remaining_bank, total_gain = solve_transfers(
+        squad, bank, num_transfers
+    )
+
+    if not swaps:
+        await update.message.reply_text(
+            f"✅ Your team is already optimal for GW{next_gw}. No immediate transfers recommended."
+        )
+        return
+
+    msg = f"🔄 *RECOMMENDED TRANSFER PLAN (GW{next_gw})*\n\n"
+    for out_p, in_p, gain in swaps:
+        msg += f"🔴 *OUT:* [{out_p['pos']}] {out_p['name']} (£{out_p['cost']}m)\n"
+        msg += f"🟢 *IN:* [{in_p['pos']}] {in_p['name']} (£{in_p['cost']}m)\n"
+        msg += f"📈 *Projected Gain:* +{gain:.2f} xP\n\n"
+
+    msg += f"💰 *Remaining Bank:* £{remaining_bank:.1f}m\n"
+    msg += f"📊 *Total Expected Gain:* +{total_gain:.2f} xP"
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def freehit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🃏 Calculating optimal Free Hit squad for maximum single GW points..."
+    )
+    squad = solve_chip_squad(horizon_gws=1)
+
+    msg = "🔥 *OPTIMAL FREE HIT SQUAD*\n\n"
+    total_cost = sum(p["cost"] for p in squad)
 
     for pos in ["GKP", "DEF", "MID", "FWD"]:
-        msg += f"\n*{pos}s:*\n"
-        pos_df = optimal_squad[optimal_squad["position"] == pos].sort_values(
-            by="ep_next", ascending=False
-        )
-        for _, row in pos_df.iterrows():
-            msg += f"• {row['web_name']} (£{row['now_cost']}m) - xP: {row['ep_next']}\n"
+        msg += f"*{pos}s:*\n"
+        for p in squad:
+            if p["pos"] == pos:
+                msg += f"• {p['name']} (£{p['cost']}m)\n"
+        msg += "\n"
 
-    msg += f"\n💰 *Total Cost:* £{optimal_squad['now_cost'].sum():.1f}m\n"
-    msg += f"📈 *Projected Squad Points:* {optimal_squad['ep_next'].sum():.1f}"
-    return msg
+    msg += f"💰 *Total Cost:* £{total_cost:.1f}m / £100.0m"
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-# ==========================================
-# COMMAND HANDLERS
-# ==========================================
-@bot.message_handler(commands=["start", "help"])
-def send_welcome(message):
-    welcome_text = (
-        "⚽ *FPL Assistant Bot Ready!*\n\n"
-        "Available Commands:\n"
-        "• /squad or /info - Generate optimal 15-player squad (£100m budget)\n"
-        "• /captain - Get top 3 captain candidates by Expected Points (xP)"
+async def wildcard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🔮 Calculating optimal Wildcard squad over a 5-10 GW horizon..."
     )
-    bot.reply_to(message, welcome_text, parse_mode="Markdown")
+    squad = solve_chip_squad(horizon_gws=5)
+
+    msg = "🃏 *OPTIMAL WILDCARD SQUAD (Multi-GW Horizon)*\n\n"
+    total_cost = sum(p["cost"] for p in squad)
+
+    for pos in ["GKP", "DEF", "MID", "FWD"]:
+        msg += f"*{pos}s:*\n"
+        for p in squad:
+            if p["pos"] == pos:
+                msg += f"• {p['name']} (£{p['cost']}m)\n"
+        msg += "\n"
+
+    msg += f"💰 *Total Cost:* £{total_cost:.1f}m / £100.0m"
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-@bot.message_handler(commands=["squad", "info"])
-def send_squad(message):
-    bot.reply_to(message, "⏳ Calculating optimal squad... Please wait.")
-    try:
-        squad_msg = get_fpl_squad_message()
-        bot.send_message(message.chat.id, squad_msg, parse_mode="Markdown")
-    except Exception as e:
-        bot.send_message(
-            message.chat.id, f"⚠️ Error calculating squad: {str(e)}"
-        )
+# --- BOT INITIALIZATION ---
 
-
-@bot.message_handler(commands=["captain"])
-def send_captain(message):
-    bot.reply_to(message, "⏳ Fetching captain recommendations...")
-    try:
-        response = requests.get(FPL_BOOTSTRAP_URL, timeout=10)
-        data = response.json()
-
-        teams = {t["id"]: t["short_name"] for t in data.get("teams", [])}
-        players = []
-
-        for p in data.get("elements", []):
-            if p.get("ep_next") is not None:
-                try:
-                    players.append(
-                        {
-                            "name": p["web_name"],
-                            "team": teams.get(p["team"], "UNK"),
-                            "ep": float(p["ep_next"]),
-                        }
-                    )
-                except ValueError:
-                    continue
-
-        top_3 = sorted(players, key=lambda x: x["ep"], reverse=True)[:3]
-
-        if not top_3:
-            bot.send_message(
-                message.chat.id, "Could not retrieve captain data."
-            )
-            return
-
-        msg = "👑 *Top 3 Captain Candidates (Expected Points):*\n\n"
-        for idx, p in enumerate(top_3, start=1):
-            msg += f"{idx}. *{p['name']}* ({p['team']}) — *{p['ep']:.1f} xP*\n"
-
-        bot.send_message(message.chat.id, msg, parse_mode="Markdown")
-    except Exception as e:
-        bot.send_message(
-            message.chat.id, f"⚠️ Error fetching captain data: {str(e)}"
-        )
-
-
-# ==========================================
-# MAIN ENTRY POINT
-# ==========================================
 if __name__ == "__main__":
-    # Run Flask in a background thread
-    server_thread = threading.Thread(target=run_web_server)
-    server_thread.daemon = True
-    server_thread.start()
+    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set!")
 
-    print("Bot is live and polling for Telegram commands...")
-    bot.infinity_polling()
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("setteam", setteam_cmd))
+    app.add_handler(CommandHandler("squad", squad_cmd))
+    app.add_handler(CommandHandler("transfers", transfers_cmd))
+    app.add_handler(CommandHandler("freehit", freehit_cmd))
+    app.add_handler(CommandHandler("wildcard", wildcard_cmd))
+
+    print("Telegram FPL Bot is active and listening for commands...")
+    app.run_polling()
