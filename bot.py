@@ -420,6 +420,19 @@ async def wildcard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- BOT INITIALIZATION ---
 
+# --- FLASK KEEP-ALIVE SERVER (FOR RENDER WEB SERVICE) ---
+from flask import Flask
+
+flask_app = Flask(__name__)
+
+
+@flask_app.route("/")
+def health_check():
+    return "FPL Telegram Bot is running live!", 200
+
+
+# --- BOT INITIALIZATION ---
+
 if __name__ == "__main__":
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     if not TOKEN:
