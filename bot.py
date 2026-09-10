@@ -421,41 +421,58 @@ async def wildcard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-# --- FLASK KEEP-ALIVE SERVER (FOR RENDER WEB SERVICE) ---
+# --- FLASK & TELEGRAM WEBHOOK INTEGRATION ---
 
 flask_app = Flask(__name__)
+
+# Initialize the Telegram Application globally
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set!")
+
+# Build the app without running polling
+telegram_app = ApplicationBuilder().token(TOKEN).build()
+
+telegram_app.add_handler(CommandHandler("start", start_cmd))
+telegram_app.add_handler(CommandHandler("setteam", setteam_cmd))
+telegram_app.add_handler(CommandHandler("squad", squad_cmd))
+telegram_app.add_handler(CommandHandler("transfers", transfers_cmd))
+telegram_app.add_handler(CommandHandler("freehit", freehit_cmd))
+telegram_app.add_handler(CommandHandler("wildcard", wildcard_cmd))
 
 
 @flask_app.route("/")
 def health_check():
-    return "FPL Telegram Bot is running live!", 200
+    return "FPL Telegram Bot is running live via Webhooks!", 200
 
 
-# --- BOT BACKGROUND RUNNER ---
+@flask_app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+    """Endpoint that receives updates directly from Telegram."""
+    from flask import request
+    import asyncio
 
-def run_telegram_bot():
-    """Runs the bot polling loop cleanly in a background thread."""
-    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set!")
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        
+        # Run the update processing in the async event loop
+        async def process():
+            await telegram_app.initialize()
+            await telegram_app.process_update(update)
 
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("setteam", setteam_cmd))
-    app.add_handler(CommandHandler("squad", squad_cmd))
-    app.add_handler(CommandHandler("transfers", transfers_cmd))
-    app.add_handler(CommandHandler("freehit", freehit_cmd))
-    app.add_handler(CommandHandler("wildcard", wildcard_cmd))
-
-    print("Telegram FPL Bot is active and listening for commands...")
-    app.run_polling()
+        asyncio.run(process())
+        return "OK", 200
+    return "Forbidden", 403
 
 
-# Start the bot in a background thread so Gunicorn/Flask can run on the main thread
-bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
-bot_thread.start()
-
+# Automatically set the webhook URL with Telegram when Gunicorn boots up
+with flask_app.app_context():
+    import requests as req
+    RENDER_URL = os.getenv("RENDER_EXTERNAL_URL") # Render automatically provides this!
+    if RENDER_URL:
+        webhook_url = f"{RENDER_URL}/{TOKEN}"
+        req.get(f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={webhook_url}")
+        print(f"Webhook automatically set to: {webhook_url}")
 
 # Keep this for local testing if needed
 if __name__ == "__main__":
