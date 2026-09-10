@@ -421,9 +421,7 @@ async def wildcard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- BOT INITIALIZATION ---
 
 if __name__ == "__main__":
-    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set!")
+    TOKEN = "7999571480:AAHLu28JqoZy8vy0901DoFM"
 
     app = ApplicationBuilder().token(TOKEN).build()
 
