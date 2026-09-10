@@ -1,6 +1,6 @@
+python-telegram-bot
 requests
-pandas
 pulp
-pyTelegramBotAPI
+pandas
 flask
 gunicorn
