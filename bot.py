@@ -420,6 +420,9 @@ async def wildcard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- BOT INITIALIZATION ---
 
+import threading
+import asyncio
+
 # --- FLASK KEEP-ALIVE SERVER (FOR RENDER WEB SERVICE) ---
 from flask import Flask
 
@@ -431,9 +434,14 @@ def health_check():
     return "FPL Telegram Bot is running live!", 200
 
 
-# --- BOT INITIALIZATION ---
+# --- BOT BACKGROUND RUNNER ---
 
-if __name__ == "__main__":
+def run_telegram_bot():
+    """Runs the bot polling loop in a background thread."""
+    # Create a new event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     if not TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set!")
@@ -449,3 +457,13 @@ if __name__ == "__main__":
 
     print("Telegram FPL Bot is active and listening for commands...")
     app.run_polling()
+
+
+# Start the bot in a background thread so Gunicorn/Flask can run on the main thread
+bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
+bot_thread.start()
+
+
+# Keep this for local testing if needed
+if __name__ == "__main__":
+    flask_app.run(host="0.0.0.0", port=10000)
