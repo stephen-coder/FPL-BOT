@@ -1,226 +1,241 @@
-from datetime import datetime, timezone
+import datetime
+import os
 import pandas as pd
-from pulp import LpMaximize, LpProblem, LpStatus, LpVariable, lpSum
+import pulp
 import requests
 
 # ==========================================
-# CONFIGURATION & WEBHOOKS
+# CONFIGURATION & TELEGRAM CREDENTIALS
 # ==========================================
-# Paste your Discord or Telegram Webhook details here (or leave blank to skip)
-DISCORD_WEBHOOK_URL = ""  # e.g., "https://discord.com/api/webhooks/..."
-TELEGRAM_BOT_TOKEN = ""  # e.g., "123456789:ABCdef..."
-TELEGRAM_CHAT_ID = ""  # e.g., "987654321"
+DISCORD_WEBHOOK_URL = ""
+TELEGRAM_BOT_TOKEN = "7999571480:AAHLu28JqoZy8vyO90iDoFMtFlhvAYun5Ng"
+TELEGRAM_CHAT_ID = "5768618690"
 
-FPL_BASE_URL = "https://fantasy.premierleague.com/api/"
+FPL_BOOTSTRAP_URL = "https://fantasy.premierleague.com/api/bootstrap-static/"
+
+POSITION_MAP = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
 
 
 # ==========================================
-# 1. FETCH FPL DATA
+# NOTIFICATION FUNCTION
 # ==========================================
-def fetch_fpl_data():
-    """Fetch general FPL data including players, teams, and gameweeks."""
-    response = requests.get(f"{FPL_BASE_URL}bootstrap-static/")
-    if response.status_code != 200:
-        raise Exception("Failed to fetch data from FPL API")
+def send_notification(message):
+    print(
+        f"\n--- NOTIFICATION OUTPUT ---\n{message}\n---------------------------"
+    )
+
+    # Send to Telegram
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            payload = {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": "Markdown",
+            }
+            res = requests.post(telegram_url, json=payload)
+            if res.status_code == 200:
+                print("Successfully sent message to Telegram!")
+            else:
+                print(
+                    f"Telegram error response: {res.status_code} - {res.text}"
+                )
+        except Exception as e:
+            print(f"Failed to send Telegram notification: {e}")
+
+    # Send to Discord
+    if DISCORD_WEBHOOK_URL and DISCORD_WEBHOOK_URL.startswith("http"):
+        try:
+            res = requests.post(
+                DISCORD_WEBHOOK_URL, json={"content": message}
+            )
+            if res.status_code in [200, 204]:
+                print("Successfully sent message to Discord!")
+            else:
+                print(f"Discord error response: {res.status_code} - {res.text}")
+        except Exception as e:
+            print(f"Failed to send Discord notification: {e}")
+
+
+# ==========================================
+# FPL DATA RETRIEVAL
+# ==========================================
+def get_fpl_data():
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/115.0.0.0 Safari/537.36"
+        )
+    }
+    response = requests.get(FPL_BOOTSTRAP_URL, headers=headers)
+    response.raise_for_status()
     return response.json()
 
 
-def get_next_deadline_info(data):
-    """Find the next gameweek ID and deadline timestamp."""
-    for gw in data["events"]:
-        if gw["is_next"]:
-            deadline_str = gw["deadline_time"]
-            deadline_dt = datetime.fromisoformat(
-                deadline_str.replace("Z", "+00:00")
-            )
-            return gw["id"], deadline_dt
-    return None, None
-
-
 # ==========================================
-# 2. SQUAD OPTIMIZER (PuLP Solver)
+# SQUAD OPTIMIZER (PuLP)
 # ==========================================
-def optimize_squad(data, budget=100.0):
-    """Solves the 15-player linear optimization problem to maximize expected points (xP)."""
-    elements = pd.DataFrame(data["elements"])
+def optimize_squad(players_df, budget=100.0):
+    prob = pulp.LpProblem("FPL_Optimization", pulp.LpMaximize)
 
-    # Calculate xP (using form / ep_next as proxy for expected points)
-    elements["xP"] = pd.to_numeric(elements["ep_next"], errors="coerce").fillna(
-        0
+    player_vars = pulp.LpVariable.dicts(
+        "Player", players_df.index, cat="Binary"
     )
-    elements["now_cost"] = elements["now_cost"] / 10.0  # Convert to millions
 
-    # Filter out unavailable players
-    active_players = elements[
-        elements["status"].isin(["a", "d"])
-    ].reset_index(drop=True)
-
-    # Initialize PuLP Optimization Model
-    model = LpProblem(name="FPL-Squad-Optimization", sense=LpMaximize)
-
-    # Binary variable x_i for each player (1 if chosen, 0 if not)
-    player_vars = [
-        LpVariable(name=f"p_{i}", cat="Binary")
-        for i in range(len(active_players))
-    ]
-
-    # Objective: Maximize total expected points
-    model += (
-        lpSum(
+    # Objective: Maximize total predicted points
+    prob += (
+        pulp.lpSum(
             [
-                active_players.loc[i, "xP"] * player_vars[i]
-                for i in range(len(active_players))
+                player_vars[i] * players_df.loc[i, "ep_next"]
+                for i in players_df.index
             ]
         ),
-        "Total_xP",
+        "Total_Expected_Points",
     )
 
-    # Constraint 1: Budget limit (£100.0m)
-    model += (
-        lpSum(
+    # Constraint 1: Budget limit (100.0m)
+    prob += (
+        pulp.lpSum(
             [
-                active_players.loc[i, "now_cost"] * player_vars[i]
-                for i in range(len(active_players))
+                player_vars[i] * players_df.loc[i, "now_cost"]
+                for i in players_df.index
             ]
         )
         <= budget,
         "Budget_Limit",
     )
 
-    # Constraint 2: Total squad size = 15
-    model += (
-        lpSum([player_vars[i] for i in range(len(active_players))]) == 15,
-        "Squad_Size",
+    # Constraint 2: Exactly 15 players
+    prob += (
+        pulp.lpSum([player_vars[i] for i in players_df.index]) == 15,
+        "Total_Players",
     )
 
     # Constraint 3: Position limits (2 GKP, 5 DEF, 5 MID, 3 FWD)
-    positions = {1: 2, 2: 5, 3: 5, 4: 3}
-    for pos_id, count in positions.items():
-        model += (
-            lpSum(
-                [
-                    player_vars[i]
-                    for i in range(len(active_players))
-                    if active_players.loc[i, "element_type"] == pos_id
-                ]
-            )
-            == count,
-            f"Position_{pos_id}_Limit",
+    prob += (
+        pulp.lpSum(
+            [
+                player_vars[i]
+                for i in players_df.index
+                if players_df.loc[i, "position"] == "GKP"
+            ]
         )
+        == 2,
+        "GKP_Count",
+    )
+    prob += (
+        pulp.lpSum(
+            [
+                player_vars[i]
+                for i in players_df.index
+                if players_df.loc[i, "position"] == "DEF"
+            ]
+        )
+        == 5,
+        "DEF_Count",
+    )
+    prob += (
+        pulp.lpSum(
+            [
+                player_vars[i]
+                for i in players_df.index
+                if players_df.loc[i, "position"] == "MID"
+            ]
+        )
+        == 5,
+        "MID_Count",
+    )
+    prob += (
+        pulp.lpSum(
+            [
+                player_vars[i]
+                for i in players_df.index
+                if players_df.loc[i, "position"] == "FWD"
+            ]
+        )
+        == 3,
+        "FWD_Count",
+    )
 
-    # Constraint 4: Maximum 3 players per Premier League team
-    teams = active_players["team"].unique()
-    for team_id in teams:
-        model += (
-            lpSum(
+    # Constraint 4: Max 3 players per team
+    for team_id in players_df["team"].unique():
+        prob += (
+            pulp.lpSum(
                 [
                     player_vars[i]
-                    for i in range(len(active_players))
-                    if active_players.loc[i, "team"] == team_id
+                    for i in players_df.index
+                    if players_df.loc[i, "team"] == team_id
                 ]
             )
             <= 3,
-            f"Team_{team_id}_Limit",
+            f"Team_Limit_{team_id}",
         )
 
-    # Solve optimization problem
-    model.solve()
+    prob.solve(pulp.PULP_CBC_CMD(msg=False))
 
-    if LpStatus[model.status] == "Optimal":
-        selected_indices = [
-            i for i in range(len(active_players)) if player_vars[i].varValue == 1
-        ]
-        squad = active_players.iloc[selected_indices]
-        return squad
-    else:
-        return None
+    selected_indices = [
+        i for i in players_df.index if pulp.value(player_vars[i]) == 1
+    ]
+    return players_df.loc[selected_indices]
 
 
 # ==========================================
-# 3. NOTIFICATION DISPATCHERS
+# MAIN EXECUTION
 # ==========================================
-def send_notification(message):
-    """Sends notification to Discord or Telegram if configured."""
-    print(f"\n--- NOTIFICATION OUTPUT ---\n{message}\n---------------------------")
-
-    if DISCORD_WEBHOOK_URL:
-        try:
-            requests.post(DISCORD_WEBHOOK_URL, json={"content": message})
-            print("Successfully sent to Discord!")
-        except Exception as e:
-            print(f"Failed to send Discord notification: {e}")
-
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message})
-            print("Successfully sent to Telegram!")
-        except Exception as e:
-            print(f"Failed to send Telegram notification: {e}")
-
-
-# ==========================================
-# 4. MAIN SCHEDULED LOGIC
-# ==========================================
-def format_squad_summary(squad, title):
-    pos_map = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
-    squad["Pos"] = squad["element_type"].map(pos_map)
-    squad = squad.sort_values(by=["element_type", "xP"], ascending=[True, False])
-
-    summary = f"🚨 **FPL ALERT: {title}** 🚨\n\n"
-    summary += "**Optimal £100m Squad Pick:**\n"
-
-    total_cost = squad["now_cost"].sum()
-    total_xp = squad["xP"].sum()
-
-    for _, player in squad.iterrows():
-        summary += f"• [{player['Pos']}] {player['web_name']} - £{player['now_cost']}m (xP: {player['xP']:.1f})\n"
-
-    summary += f"\n💰 **Total Cost:** £{total_cost:.1f}m"
-    summary += f"\n📈 **Projected xP:** {total_xp:.1f} points"
-
-    return summary
-
-
 def main():
-    fpl_data = fetch_fpl_data()
-    gw_id, deadline = get_next_deadline_info(fpl_data)
+    print("Fetching FPL data...")
+    data = get_fpl_data()
 
-    if not deadline:
-        print("No upcoming gameweek deadline found.")
+    # Find Next Gameweek Deadline
+    events = data["events"]
+    next_event = next((e for e in events if e.get("is_next")), None)
+
+    if not next_event:
+        print("No upcoming Gameweek deadline found.")
         return
 
-    now = datetime.now(timezone.utc)
-    hours_left = (deadline - now).total_seconds() / 3600.0
-
-    print(f"Current UTC Time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(
-        f"Next Deadline: GW{gw_id} at {deadline.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+    gw_name = next_event["name"]
+    deadline_str = next_event["deadline_time"]
+    deadline_dt = datetime.datetime.fromisoformat(
+        deadline_str.replace("Z", "+00:00")
     )
-    print(f"Hours Remaining: {hours_left:.2f} hours")
 
-    # Target trigger windows (checked hourly)
-    target_alert = None
-    if 47.5 <= hours_left <= 48.5:
-        target_alert = f"GW{gw_id} - 48 Hours to Deadline"
-    elif 11.5 <= hours_left <= 12.5:
-        target_alert = f"GW{gw_id} - 12 Hours to Deadline"
-    elif 2.5 <= hours_left <= 3.5:
-        target_alert = f"GW{gw_id} - 3 Hours Final Lineup Alert"
+    print(f"Upcoming: {gw_name} | Deadline: {deadline_dt}")
 
-    # If triggered by manual test or inside deadline window:
-    if target_alert or True:  # Runs directly for testing
-        print(f"\nRunning squad optimization algorithm...")
-        squad = optimize_squad(fpl_data)
+    # Build DataFrame
+    players = data["elements"]
+    df = pd.DataFrame(players)
 
-        if squad is not None:
-            alert_title = (
-                target_alert if target_alert else f"GW{gw_id} Manual Check"
-            )
-            message = format_squad_summary(squad, alert_title)
-            send_notification(message)
-        else:
-            print("Error: Could not find an optimal squad solution.")
+    df["now_cost"] = df["now_cost"] / 10.0
+    df["ep_next"] = pd.to_numeric(df["ep_next"], errors="coerce").fillna(0.0)
+    df["position"] = df["element_type"].map(POSITION_MAP)
+
+    # Optimize Squad
+    print("Running squad optimization algorithm...")
+    optimal_squad = optimize_squad(df)
+
+    # Format Output Message
+    msg = f"🚨 *FPL DEADLINE ALERT: {gw_name}* 🚨\n"
+    msg += f"⏰ *Deadline:* {deadline_dt.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+    msg += "📋 *Optimal 15-Player Squad (£100m Budget):*\n"
+
+    for pos in ["GKP", "DEF", "MID", "FWD"]:
+        msg += f"\n*{pos}s:*\n"
+        pos_df = optimal_squad[optimal_squad["position"] == pos].sort_values(
+            by="ep_next", ascending=False
+        )
+        for _, row in pos_df.iterrows():
+            msg += f"• {row['web_name']} (£{row['now_cost']}m) - xP: {row['ep_next']}\n"
+
+    total_cost = optimal_squad["now_cost"].sum()
+    total_xp = optimal_squad["ep_next"].sum()
+
+    msg += f"\n💰 *Total Cost:* £{total_cost:.1f}m\n"
+    msg += f"📈 *Projected Squad Points:* {total_xp:.1f}"
+
+    # Send Notification
+    send_notification(msg)
 
 
 if __name__ == "__main__":
