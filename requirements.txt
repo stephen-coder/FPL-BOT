@@ -1,1 +1,6 @@
-
+requests
+pandas
+pulp
+pyTelegramBotAPI
+flask
+gunicorn
