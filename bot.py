@@ -1,6 +1,9 @@
 import os
 import pulp
 import requests
+import threading
+import asyncio
+from flask import Flask
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -418,13 +421,7 @@ async def wildcard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-# --- BOT INITIALIZATION ---
-
-import threading
-import asyncio
-
 # --- FLASK KEEP-ALIVE SERVER (FOR RENDER WEB SERVICE) ---
-from flask import Flask
 
 flask_app = Flask(__name__)
 
@@ -437,11 +434,7 @@ def health_check():
 # --- BOT BACKGROUND RUNNER ---
 
 def run_telegram_bot():
-    """Runs the bot polling loop in a background thread."""
-    # Create a new event loop for this thread
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
+    """Runs the bot polling loop cleanly in a background thread."""
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     if not TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set!")
