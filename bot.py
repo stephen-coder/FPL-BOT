@@ -82,7 +82,7 @@ def get_next_gw(data):
 
 
 def fetch_user_squad(team_id):
-    """Pulls a user's current 15-man squad and remaining bank balance."""
+    """Pulls a user's current 15-man squad, remaining bank balance, and team entry info."""
     data = get_fpl_bootstrap()
     next_gw = get_next_gw(data)
     prev_gw = max(1, next_gw - 1)
@@ -91,18 +91,23 @@ def fetch_user_squad(team_id):
     try:
         res = requests.get(url, headers=FPL_HEADERS, timeout=15)
     except requests.RequestException:
-        return None, 0.0, next_gw
+        return None, 0.0, next_gw, {}
 
     if res.status_code == 403:
         print(f"FPL API returned 403 for team {team_id} — likely blocked/rate-limited request")
-        return None, 0.0, next_gw
+        return None, 0.0, next_gw, {}
 
     if res.status_code != 200:
-        return None, 0.0, next_gw
+        return None, 0.0, next_gw, {}
 
     picks_data = res.json()
     picks = [p["element"] for p in picks_data["picks"]]
     bank = picks_data.get("entry_history", {}).get("bank", 0) / 10.0
+
+    # Also fetch general entry details for /stats
+    entry_url = f"{FPL_BASE_URL}entry/{team_id}/"
+    entry_res = requests.get(entry_url, headers=FPL_HEADERS, timeout=15)
+    entry_info = entry_res.json() if entry_res.status_code == 200 else {}
 
     types = {t["id"]: t["singular_name_short"] for t in data["element_types"]}
     players_by_id = {p["id"]: p for p in data["elements"]}
@@ -124,14 +129,18 @@ def fetch_user_squad(team_id):
                     "team": p["team"],
                 }
             )
-    return squad, bank, next_gw
+    return squad, bank, next_gw, entry_info
 
 
 # --- PULP OPTIMIZATION ENGINES ---
 
 
-def solve_starting_xi(squad):
-    """Solves for Starting 11, Captain (C), Vice Captain (VC), and Bench order."""
+def solve_starting_xi(squad, chip=None):
+    """Solves for Starting 11, Captain (C), Vice Captain (VC), and Bench order.
+    
+    If chip == 'benchboost', all 15 squad members contribute to the total expected points.
+    If chip == 'triplecaptain', the captain's points are multiplied by 3.
+    """
     if not squad:
         return [], []
 
@@ -145,13 +154,24 @@ def solve_starting_xi(squad):
         p["id"]: pulp.LpVariable(f"cap_{p['id']}", cat="Binary") for p in squad
     }
 
-    prob += pulp.lpSum(
-        [p["ep_next"] * start_vars[p["id"]] for p in squad]
-    ) + pulp.lpSum([p["ep_next"] * cap_vars[p["id"]] for p in squad])
+    # Objective function depends on chips
+    cap_multiplier = 3 if chip == 'triplecaptain' else 2
+    
+    if chip == 'benchboost':
+        # All 15 players score points, plus captain multiplier bonus
+        prob += pulp.lpSum([p["ep_next"] for p in squad]) + pulp.lpSum(
+            [(cap_multiplier - 1) * p["ep_next"] * cap_vars[p["id"]] for p in squad]
+        )
+        # Bench Boost forces all 15 to start conceptually for scoring
+        prob += pulp.lpSum([start_vars[p["id"]] for p in squad]) == 15
+    else:
+        prob += pulp.lpSum(
+            [p["ep_next"] * start_vars[p["id"]] for p in squad]
+        ) + pulp.lpSum([(cap_multiplier - 1) * p["ep_next"] * cap_vars[p["id"]] for p in squad])
+        prob += (
+            pulp.lpSum([start_vars[p["id"]] for p in squad]) == 11
+        ), "Exactly_11_Starters"
 
-    prob += (
-        pulp.lpSum([start_vars[p["id"]] for p in squad]) == 11
-    ), "Exactly_11_Starters"
     prob += (
         pulp.lpSum([cap_vars[p["id"]] for p in squad]) == 1
     ), "Exactly_1_Captain"
@@ -164,13 +184,13 @@ def solve_starting_xi(squad):
     mids = [p for p in squad if p["pos"] == "MID"]
     fwds = [p for p in squad if p["pos"] == "FWD"]
 
-    prob += pulp.lpSum([start_vars[p["id"]] for p in gkps]) == 1
-    prob += pulp.lpSum([start_vars[p["id"]] for p in defs]) >= 3
-    prob += pulp.lpSum([start_vars[p["id"]] for p in defs]) <= 5
-    prob += pulp.lpSum([start_vars[p["id"]] for p in mids]) >= 2
-    prob += pulp.lpSum([start_vars[p["id"]] for p in mids]) <= 5
-    prob += pulp.lpSum([start_vars[p["id"]] for p in fwds]) >= 1
-    prob += pulp.lpSum([start_vars[p["id"]] for p in fwds]) <= 3
+    prob += pulp.lpSum([start_vars[p["id"]] for p in gkps]) == (2 if chip == 'benchboost' else 1)
+    prob += pulp.lpSum([start_vars[p["id"]] for p in defs]) >= (3 if chip != 'benchboost' else 3)
+    prob += pulp.lpSum([start_vars[p["id"]] for p in defs]) <= (5 if chip != 'benchboost' else 5)
+    prob += pulp.lpSum([start_vars[p["id"]] for p in mids]) >= (2 if chip != 'benchboost' else 2)
+    prob += pulp.lpSum([start_vars[p["id"]] for p in mids]) <= (5 if chip != 'benchboost' else 5)
+    prob += pulp.lpSum([start_vars[p["id"]] for p in fwds]) >= (1 if chip != 'benchboost' else 1)
+    prob += pulp.lpSum([start_vars[p["id"]] for p in fwds]) <= (3 if chip != 'benchboost' else 3)
 
     status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
     if pulp.LpStatus[status] != "Optimal":
@@ -207,11 +227,6 @@ def solve_transfers(squad, bank, num_transfers=1):
     """
     Jointly optimizes which `num_transfers` players to sell and which to buy,
     under one shared budget, maximizing total expected-points gain.
-
-    Replaces the old greedy one-swap-at-a-time approach, which could miss
-    better combinations (e.g. selling two mid-value players to afford one
-    premium) and evaluated each swap against a shrinking bank sequentially
-    rather than jointly.
     """
     if not squad:
         return [], bank, 0.0
@@ -242,16 +257,13 @@ def solve_transfers(squad, bank, num_transfers=1):
     out_vars = {p["id"]: pulp.LpVariable(f"out_{p['id']}", cat="Binary") for p in squad}
     in_vars = {c["id"]: pulp.LpVariable(f"in_{c['id']}", cat="Binary") for c in candidates}
 
-    # Maximize net expected-points gain (points added minus points lost)
     prob += pulp.lpSum([c["ep_next"] * in_vars[c["id"]] for c in candidates]) - pulp.lpSum(
         [p["ep_next"] * out_vars[p["id"]] for p in squad]
     )
 
-    # Exactly num_transfers players leave, exactly num_transfers arrive
     prob += pulp.lpSum(out_vars.values()) == num_transfers
     prob += pulp.lpSum(in_vars.values()) == num_transfers
 
-    # Squad shape must stay valid: swaps balance position-for-position
     for pos_id in {p["pos_id"] for p in squad}:
         prob += pulp.lpSum(
             [out_vars[p["id"]] for p in squad if p["pos_id"] == pos_id]
@@ -259,12 +271,10 @@ def solve_transfers(squad, bank, num_transfers=1):
             [in_vars[c["id"]] for c in candidates if c["pos_id"] == pos_id]
         )
 
-    # Budget: bank + money freed from sales must cover new purchases
     prob += bank + pulp.lpSum(
         [p["cost"] * out_vars[p["id"]] for p in squad]
     ) >= pulp.lpSum([c["cost"] * in_vars[c["id"]] for c in candidates])
 
-    # Club limit (max 3 players per PL team) on the resulting squad
     remaining_by_team = {}
     for p in squad:
         remaining_by_team.setdefault(p["team"], []).append(p)
@@ -292,7 +302,6 @@ def solve_transfers(squad, bank, num_transfers=1):
         bank + sum(p["cost"] for p in players_out) - sum(c["cost"] for c in players_in)
     )
 
-    # Pair sells with buys of the same position for readable messaging
     swaps = []
     ins_by_pos = {}
     for c in players_in:
@@ -377,8 +386,12 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/setteam <ID>` — Link your FPL Team ID\n"
         "• `/squad` — Calculate optimal Starting XI, Captain & Bench\n"
         "• `/transfers [1 or 2]` — Optimal transfer recommendations\n"
+        "• `/hits <num_hits>` — Evaluate if taking transfer point hits is worth it\n"
+        "• `/benchboost` — Calculate optimal lineup with Bench Boost active\n"
+        "• `/triplecaptain` — Optimal lineup with Triple Captain active\n"
         "• `/freehit` — Maximum 1-GW Free Hit squad\n"
         "• `/wildcard` — Multi-GW Wildcard squad (5-10 GW horizon)\n"
+        "• `/stats` — View your team performance stats & overall rank\n"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -414,14 +427,11 @@ async def squad_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔄 Optimizing your starting XI and bench order..."
     )
-    squad, _, next_gw = fetch_user_squad(team_id)
+    squad, _, next_gw, _ = fetch_user_squad(team_id)
 
     if not squad:
         await update.message.reply_text(
-            "❌ Unable to fetch squad. This usually means either the Team ID "
-            "is wrong, or your FPL account's privacy setting is blocking "
-            "public access to your team — check Settings → Privacy on the "
-            "FPL site and make sure your team isn't set to private."
+            "❌ Unable to fetch squad. Check Settings → Privacy on the FPL site."
         )
         return
 
@@ -473,14 +483,9 @@ async def transfers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏳ Analyzing top {num_transfers} transfer recommendation(s)..."
     )
 
-    squad, bank, next_gw = fetch_user_squad(team_id)
+    squad, bank, next_gw, _ = fetch_user_squad(team_id)
     if not squad:
-        await update.message.reply_text(
-            "❌ Unable to fetch squad. This usually means either the Team ID "
-            "is wrong, or your FPL account's privacy setting is blocking "
-            "public access to your team — check Settings → Privacy on the "
-            "FPL site and make sure your team isn't set to private."
-        )
+        await update.message.reply_text("❌ Unable to fetch squad.")
         return
 
     swaps, remaining_bank, total_gain = solve_transfers(
@@ -502,6 +507,170 @@ async def transfers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg += f"💰 *Remaining Bank:* £{remaining_bank:.1f}m\n"
     msg += f"📊 *Total Expected Gain:* +{total_gain:.2f} xP"
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def hits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Calculates if taking a transfer point hit (costing 4 points per extra transfer) is mathematically worth it."""
+    team_id = get_team_id(update.effective_chat.id)
+    if not team_id:
+        await update.message.reply_text(
+            "⚠️ Link your team first using `/setteam <ID>`."
+        )
+        return
+
+    num_hits = 1
+    if context.args:
+        try:
+            num_hits = max(int(context.args[0]), 1)
+        except ValueError:
+            num_hits = 1
+
+    # Each extra transfer costs 4 points
+    cost_in_points = num_hits * 4
+
+    await update.message.reply_text(
+        f"⚖️ Evaluating if taking {num_hits} extra transfer(s) (costing {cost_in_points} pts) is worth it..."
+    )
+
+    squad, bank, next_gw, _ = fetch_user_squad(team_id)
+    if not squad:
+        await update.message.reply_text("❌ Unable to fetch squad.")
+        return
+
+    # Evaluate optimal transfers for (1 free transfer + num_hits extra transfers)
+    swaps, remaining_bank, total_gain = solve_transfers(
+        squad, bank, num_transfers=1 + num_hits
+    )
+
+    if not swaps:
+        await update.message.reply_text(
+            f"❌ Could not find valid transfers for {1 + num_hits} moves."
+        )
+        return
+
+    net_gain = total_gain - cost_in_points
+    is_worth_it = net_gain > 0
+
+    msg = f"⚖️ *TRANSFER HIT ANALYSIS (GW{next_gw})\n\n"
+    msg += f"• Extra Transfers / Hit Cost: *{num_hits} (-{cost_in_points} pts)*\n"
+    msg += f"• Projected xP Gain from Transfers: *+{total_gain:.2f} xP*\n"
+    msg += f"• Net Expected Gain: *{net_gain:+.2f} xP*\n\n"
+
+    if is_worth_it:
+        msg += "✅ *Verdict:* **WORTH IT!** The expected points gain outweighs the hit cost.\n\n"
+    else:
+        msg += "❌ *Verdict:* **NOT RECOMMENDED.** The expected gain does not cover the 4-point penalty cost.\n\n"
+
+    msg += "🔄 *Proposed Moves:*\n"
+    for out_p, in_p, gain in swaps:
+        msg += f"• OUT: {out_p['name']} | IN: {in_p.get('name', 'None')} (+{gain:.2f} xP)\n"
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def benchboost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Calculates optimal lineup with Bench Boost chip active."""
+    team_id = get_team_id(update.effective_chat.id)
+    if not team_id:
+        await update.message.reply_text(
+            "⚠️ Link your team first using `/setteam <ID>`."
+        )
+        return
+
+    await update.message.reply_text("🚀 Calculating optimal squad performance with **Bench Boost** active...")
+    squad, _, next_gw, _ = fetch_user_squad(team_id)
+    if not squad:
+        await update.message.reply_text("❌ Unable to fetch squad.")
+        return
+
+    starters, bench = solve_starting_xi(squad, chip='benchboost')
+    if not starters:
+        await update.message.reply_text("❌ Couldn't compute a valid lineup.")
+        return
+
+    total_xp = sum(p["ep_next"] for p in starters) + sum(p["ep_next"] for p in bench)
+
+    msg = f"🚀 *GW{next_gw} BENCH BOOST LINEUP*\n"
+    msg += f"📊 *Total Projected Score (All 15):* {total_xp:.1f} xP\n\n🟢 *STARTING XI*\n"
+    for p in starters:
+        msg += f"• [{p['pos']}] *{p['name']}* — {p['ep_next']} xP\n"
+
+    msg += "\n🪑 *BENCH (Now Scoring Points!)*\n"
+    for p in bench:
+        msg += f"• [{p['pos']}] *{p['name']}* — {p['ep_next']} xP\n"
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def triplecaptain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Calculates optimal lineup with Triple Captain chip active."""
+    team_id = get_team_id(update.effective_chat.id)
+    if not team_id:
+        await update.message.reply_text(
+            "⚠️ Link your team first using `/setteam <ID>`."
+        )
+        return
+
+    await update.message.reply_text("⭐ Calculating optimal squad performance with **Triple Captain** active...")
+    squad, _, next_gw, _ = fetch_user_squad(team_id)
+    if not squad:
+        await update.message.reply_text("❌ Unable to fetch squad.")
+        return
+
+    starters, bench = solve_starting_xi(squad, chip='triplecaptain')
+    if not starters:
+        await update.message.reply_text("❌ Couldn't compute a valid lineup.")
+        return
+
+    total_xp = sum(p["ep_next"] for p in starters) + 2 * sum(
+        p["ep_next"] for p in starters if p.get("is_captain")
+    )
+
+    msg = f"⭐ *GW{next_gw} TRIPLE CAPTAIN LINEUP*\n"
+    msg += f"📊 *Projected Score (Captain x3):* {total_xp:.1f} xP\n\n🟢 *STARTING XI*\n"
+    for p in starters:
+        role = ""
+        if p.get("is_captain"):
+            role = " *(TRIPLE CAPTAIN)*"
+        elif p.get("is_vice"):
+            role = " *(VC)*"
+        msg += f"• [{p['pos']}] *{p['name']}*{role} — {p['ep_next']} xP\n"
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays user performance statistics, overall rank, and team details."""
+    team_id = get_team_id(update.effective_chat.id)
+    if not team_id:
+        await update.message.reply_text(
+            "⚠️ Link your team first using `/setteam <ID>`."
+        )
+        return
+
+    await update.message.reply_text("📊 Fetching your team statistics...")
+    _, _, next_gw, entry_info = fetch_user_squad(team_id)
+
+    if not entry_info:
+        await update.message.reply_text("❌ Could not retrieve team stats. Check Team ID.")
+        return
+
+    team_name = entry_info.get("name", "Unknown Team")
+    player_name = f"{entry_info.get('player_first_name', '')} {entry_info.get('player_last_name', '')}".strip()
+    overall_points = entry_info.get("summary_overall_points", "N/A")
+    overall_rank = entry_info.get("summary_overall_rank", "N/A")
+    team_value = entry_info.get("last_deadline_value", 0) / 10.0
+    bank = entry_info.get("last_deadline_bank", 0) / 10.0
+
+    msg = f"📊 *TEAM STATISTICS & PROFILE*\n\n"
+    msg += f"• *Team Name:* {team_name}\n"
+    msg += f"• *Manager:* {player_name}\n"
+    msg += f"• *Overall Points:* {overall_points}\n"
+    msg += f"• *Overall Rank:* {f'{overall_rank:,}' if isinstance(overall_rank, int) else overall_rank}\n"
+    msg += f"• *Squad Value:* £{team_value:.1f}m\n"
+    msg += f"• *Bank Balance:* £{bank:.1f}m\n"
 
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -566,8 +735,12 @@ telegram_app.add_handler(CommandHandler("start", start_cmd))
 telegram_app.add_handler(CommandHandler("setteam", setteam_cmd))
 telegram_app.add_handler(CommandHandler("squad", squad_cmd))
 telegram_app.add_handler(CommandHandler("transfers", transfers_cmd))
+telegram_app.add_handler(CommandHandler("hits", hits_cmd))
+telegram_app.add_handler(CommandHandler("benchboost", benchboost_cmd))
+telegram_app.add_handler(CommandHandler("triplecaptain", triplecaptain_cmd))
 telegram_app.add_handler(CommandHandler("freehit", freehit_cmd))
 telegram_app.add_handler(CommandHandler("wildcard", wildcard_cmd))
+telegram_app.add_handler(CommandHandler("stats", stats_cmd))
 
 # One persistent event loop for the whole process, run on a background
 # thread. This fixes the original design, which called asyncio.run()
