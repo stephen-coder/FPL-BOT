@@ -480,7 +480,7 @@ async def transfers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             num_transfers = 1
 
     await update.message.reply_text(
-        f"⏳ Analyzing top {num_transfers} transfer recommendation(s)..."
+        f"⏳ Analyzing top {num_transfers} transfer recommendation(s) and simulating your post-transfer squad..."
     )
 
     squad, bank, next_gw, _ = fetch_user_squad(team_id)
@@ -498,6 +498,20 @@ async def transfers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # 1. Build the list of outgoing and incoming player IDs
+    out_ids = {out_p["id"] for out_p, _, _ in swaps}
+    incoming_players = [in_p for _, in_p, _ in swaps if in_p is not None]
+
+    # 2. Construct the new 15-man squad
+    new_squad = [p for p in squad if p["id"] not in out_ids] + incoming_players
+
+    # 3. Solve the optimal starting XI for the NEW squad
+    new_starters, new_bench = solve_starting_xi(new_squad)
+    new_total_xp = sum(p["ep_next"] for p in new_starters) + sum(
+        p["ep_next"] for p in new_starters if p.get("is_captain")
+    )
+
+    # 4. Format the output message
     msg = f"🔄 *RECOMMENDED TRANSFER PLAN (GW{next_gw})*\n\n"
     for out_p, in_p, gain in swaps:
         msg += f"🔴 *OUT:* [{out_p['pos']}] {out_p['name']} (£{out_p['cost']}m)\n"
@@ -506,7 +520,12 @@ async def transfers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"📈 *Projected Gain:* +{gain:.2f} xP\n\n"
 
     msg += f"💰 *Remaining Bank:* £{remaining_bank:.1f}m\n"
-    msg += f"📊 *Total Expected Gain:* +{total_gain:.2f} xP"
+    msg += f"📊 *Total Expected Gain:* +{total_gain:.2f} xP\n\n"
+
+    msg += f"📋 *NEW POST-TRANSFER STARTING XI* (Proj: {new_total_xp:.1f} xP)\n"
+    for p in new_starters:
+        role = " *(C)*" if p.get("is_captain") else (" *(VC)*" if p.get("is_vice") else "")
+        msg += f"• [{p['pos']}] *{p['name']}*{role} — {p['ep_next']} xP\n"
 
     await update.message.reply_text(msg, parse_mode="Markdown")
 
