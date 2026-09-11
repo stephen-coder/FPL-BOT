@@ -1,8 +1,6 @@
 import os
 import pulp
 import requests
-import asyncio
-from flask import Flask, request
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -215,13 +213,13 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/squad` — Calculate optimal Starting XI, Captain & Bench\n"
         "• `/transfers [1 or 2]` — Optimal transfer recommendations\n"
         "• `/freehit` — Maximum 1-GW Free Hit squad\n"
-        "• `/wildcard` — Multi-GW Wildcard squad (5-10 GW horizon)\n"
+        "• `/wildcard` — Multi-GW Wildcard squad\n"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def setteam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ Usage: `/setteam <Your_FPL_ID>`", parse_mode="Markdown")
+        await update.message.reply_text("❌ Usage: `/setteam <Your_FPL_ID>`", parse_Mode="Markdown")
         return
 
     team_id = context.args[0]
@@ -257,7 +255,7 @@ async def squad_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg += "\n🪑 *BENCH ROTATION ORDER*\n"
     for idx, p in enumerate(bench, 1):
-        msg += f"{idx}. [{p['pos‍']}] {p['name']} — {p['ep_next']} xP\n"
+        msg += f"{idx}. [{p['pos']}] {p['name']} — {p['ep_next']} xP\n"
 
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -299,7 +297,7 @@ async def transfers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def freehit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🃏 Calculating optimal Free Hit squad for maximum single GW points...")
+    await update.message.reply_text("🃏 Calculating optimal Free Hit squad...")
     squad = solve_chip_squad(horizon_gws=1)
 
     msg = "🔥 *OPTIMAL FREE HIT SQUAD*\n\n"
@@ -316,10 +314,10 @@ async def freehit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def wildcard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔮 Calculating optimal Wildcard squad over a 5-10 GW horizon...")
+    await update.message.reply_text("🔮 Calculating optimal Wildcard squad...")
     squad = solve_chip_squad(horizon_gws=5)
 
-    msg = "🃏 *OPTIMAL WILDCARD SQUAD (Multi-GW Horizon)*\n\n"
+    msg = "🃏 *OPTIMAL WILDCARD SQUAD*\n\n"
     total_cost = sum(p["cost"] for p in squad)
 
     for pos in ["GKP", "DEF", "MID", "FWD"]:
@@ -332,52 +330,25 @@ async def wildcard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += f"💰 *Total Cost:* £{total_cost:.1f}m / £100.0m"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-# --- FLASK & TELEGRAM WEBHOOK INTEGRATION ---
+def main():
+    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set!")
 
-flask_app = Flask(__name__)
+    # Clear any old webhooks automatically so polling can take over cleanly
+    requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=true")
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set!")
+    app = ApplicationBuilder().token(TOKEN).build()
 
-telegram_app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("setteam", setteam_cmd))
+    app.add_handler(CommandHandler("squad", squad_cmd))
+    app.add_handler(CommandHandler("transfers", transfers_cmd))
+    app.add_handler(CommandHandler("freehit", freehit_cmd))
+    app.add_handler(CommandHandler("wildcard", wildcard_cmd))
 
-telegram_app.add_handler(CommandHandler("start", start_cmd))
-telegram_app.add_handler(CommandHandler("setteam", setteam_cmd))
-telegram_app.add_handler(CommandHandler("squad", squad_cmd))
-telegram_app.add_handler(CommandHandler("transfers", transfers_cmd))
-telegram_app.add_handler(CommandHandler("freehit", freehit_cmd))
-telegram_app.add_handler(CommandHandler("wildcard", wildcard_cmd))
-
-# Initialize and start the application once on startup to avoid per-request lifecycle overhead
-async def setup_webhook_app():
-    await telegram_app.initialize()
-    await telegram_app.start()
-    RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
-    if RENDER_URL:
-        webhook_url = f"{RENDER_URL}/{TOKEN}"
-        requests.get(f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={webhook_url}", headers=HEADERS)
-        print(f"Webhook automatically set to: {webhook_url}")
-
-asyncio.run(setup_webhook_app())
-
-@flask_app.route("/")
-def health_check():
-    return "FPL Telegram Bot is running live via Webhooks!", 200
-
-@flask_app.route(f"/{TOKEN}", methods=["POST"])
-def webhook():
-    """Endpoint that receives updates directly from Telegram without re-initializing."""
-    if request.method == "POST":
-        update_json = request.get_json(force=True)
-        update = Update.de_json(update_json, telegram_app.bot)
-
-        async def process():
-            await telegram_app.process_update(update)
-
-        asyncio.run(process())
-        return "OK", 200
-    return "Forbidden", 403
+    print("🤖 Bot is up and running via Long Polling...")
+    app.run_polling()
 
 if __name__ == "__main__":
-    flask_app.run(host="0.0.0.0", port=10000)
+    main()
