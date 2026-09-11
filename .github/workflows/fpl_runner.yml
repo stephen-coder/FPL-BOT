@@ -60,6 +60,11 @@ def get_next_deadline_info():
 # 2. STRICT MULTI-TRANSFER PACKAGE ENGINE
 # ==========================================
 
+# Cap on how many positional candidates we consider per outgoing slot before
+# taking the product across slots. Keeps itertools.product from exploding
+# when the live player_pool has hundreds of eligible players per position.
+MAX_CANDIDATES_PER_SLOT = 6
+
 def recommend_transfer_package(
     squad_players: list, 
     player_pool: list, 
@@ -79,9 +84,30 @@ def recommend_transfer_package(
         key=lambda x: x[0]
     )
     
-    # Ensure we pull enough bottom candidates to form combinations of 'target_transfers'
+    # Build the weakest-candidate pool with positional balance: rather than
+    # taking a flat top-N by score (which can skew toward one position and
+    # starve others out of consideration), pull the weakest players from
+    # EACH position first, then fill any remaining slots by overall score.
     candidate_pool_size = max(8, target_transfers + 3)
-    weakest_candidates = [p for _, p in squad_scored[:candidate_pool_size]]
+    positions_present = {p['position'] for p in squad_players}
+    per_position_quota = max(1, candidate_pool_size // max(1, len(positions_present)))
+
+    weakest_candidates = []
+    seen_ids = set()
+    for pos in positions_present:
+        pos_sorted = [p for score, p in squad_scored if p['position'] == pos]
+        for p in pos_sorted[:per_position_quota]:
+            if p['id'] not in seen_ids:
+                weakest_candidates.append(p)
+                seen_ids.add(p['id'])
+
+    # Top up to candidate_pool_size by overall weakest score if quotas left gaps
+    for score, p in squad_scored:
+        if len(weakest_candidates) >= candidate_pool_size:
+            break
+        if p['id'] not in seen_ids:
+            weakest_candidates.append(p)
+            seen_ids.add(p['id'])
     
     best_package = None
     max_net_gain = float('-inf')
@@ -93,6 +119,16 @@ def recommend_transfer_package(
     for out_group in itertools.combinations(weakest_candidates, target_transfers):
         sells = [calculate_selling_price(p['purchase_price'], p['current_price']) for p in out_group]
         combined_cost = sum(sells) + bank
+
+        # Clubs the remaining (non-transferred-out) squad already holds, so we
+        # can enforce FPL's max-3-players-per-club rule on the incoming group.
+        out_ids = {p['id'] for p in out_group}
+        remaining_squad = [p for p in squad_players if p['id'] not in out_ids]
+        club_counts = {}
+        for p in remaining_squad:
+            club = p.get('team')
+            if club is not None:
+                club_counts[club] = club_counts.get(club, 0) + 1
         
         positional_targets = []
         valid_combo = True
@@ -107,7 +143,17 @@ def recommend_transfer_package(
             if not valid:
                 valid_combo = False
                 break
-            positional_targets.append(valid)
+
+            # Cap candidates per slot, but keep it smart: take the top-N by
+            # horizon score AND separately keep the single cheapest affordable
+            # option, so a budget-constrained best package isn't excluded just
+            # because its incoming player didn't crack the top-N by score.
+            valid.sort(key=lambda t: calculate_horizon_score(t['id'], fixtures_data), reverse=True)
+            slot_candidates = valid[:MAX_CANDIDATES_PER_SLOT]
+            cheapest = min(valid, key=lambda t: t['cost'])
+            if cheapest['id'] not in {t['id'] for t in slot_candidates}:
+                slot_candidates.append(cheapest)
+            positional_targets.append(slot_candidates)
             
         if not valid_combo:
             continue
@@ -116,6 +162,19 @@ def recommend_transfer_package(
         for in_group in itertools.product(*positional_targets):
             # Ensure all incoming players are unique individuals
             if len({t['id'] for t in in_group}) < target_transfers:
+                continue
+
+            # Enforce max 3 players per real-life club across remaining squad + incoming
+            in_club_counts = dict(club_counts)
+            club_limit_ok = True
+            for t in in_group:
+                club = t.get('team')
+                if club is not None:
+                    in_club_counts[club] = in_club_counts.get(club, 0) + 1
+                    if in_club_counts[club] > 3:
+                        club_limit_ok = False
+                        break
+            if not club_limit_ok:
                 continue
                 
             # Check if total cost fits within budget
@@ -170,13 +229,29 @@ async def check_deadline_job(context: ContextTypes.DEFAULT_TYPE):
     
     hours_left = (deadline - now).total_seconds() / 3600.0
 
+    # Deadline has passed: nothing left to alert on for this gameweek, so
+    # drop its tracker entry instead of letting ALERT_TRACKER grow forever.
+    if hours_left <= 0:
+        ALERT_TRACKER.pop(gw_id, None)
+        return
+
     if gw_id not in ALERT_TRACKER:
         ALERT_TRACKER[gw_id] = {48: False, 24: False, 12: False, 2: False}
 
-    milestones = [(48, 46), (24, 22), (12, 10), (2, 0.5)]
-    
-    for target_hr, lower_bound in milestones:
-        if lower_bound <= hours_left <= target_hr and not ALERT_TRACKER[gw_id][target_hr]:
+    # Also drop tracker entries for any older gameweeks still lingering
+    # (e.g. left behind if a deadline was ever missed while offline).
+    for old_gw_id in [g for g in ALERT_TRACKER if g != gw_id and g < gw_id]:
+        ALERT_TRACKER.pop(old_gw_id, None)
+
+    # No lower bound here: if the bot was offline and skipped straight past
+    # a milestone (e.g. hours_left dropped from 50 to 20 between polls), the
+    # 48h and 24h alerts still fire late instead of being silently skipped.
+    # Only one alert is sent per run (via break); any others still pending
+    # catch up on subsequent polls.
+    milestones = [48, 24, 12, 2]
+
+    for target_hr in milestones:
+        if hours_left <= target_hr and not ALERT_TRACKER[gw_id][target_hr]:
             alert_message = (
                 f"🚨 **FPL Deadline Alert!**\n\n"
                 f"⏰ **{gw_name} deadline is in ~{target_hr} hours!**\n"
@@ -228,18 +303,18 @@ async def transfers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     banked_fts = 2  
     bank = 15       # £1.5m in the bank (stored in tenths)
     squad_players = [
-        {"id": 1, "name": "Saka", "position": "MID", "purchase_price": 95, "current_price": 100},
-        {"id": 2, "name": "Haaland", "position": "FWD", "purchase_price": 140, "current_price": 150},
-        {"id": 3, "name": "Pickford", "position": "GKP", "purchase_price": 50, "current_price": 50},
-        {"id": 4, "name": "Gabriel", "position": "DEF", "purchase_price": 60, "current_price": 62},
-        {"id": 5, "name": "Bowen", "position": "MID", "purchase_price": 75, "current_price": 75},
+        {"id": 1, "name": "Saka", "position": "MID", "purchase_price": 95, "current_price": 100, "team": "ARS"},
+        {"id": 2, "name": "Haaland", "position": "FWD", "purchase_price": 140, "current_price": 150, "team": "MCI"},
+        {"id": 3, "name": "Pickford", "position": "GKP", "purchase_price": 50, "current_price": 50, "team": "EVE"},
+        {"id": 4, "name": "Gabriel", "position": "DEF", "purchase_price": 60, "current_price": 62, "team": "ARS"},
+        {"id": 5, "name": "Bowen", "position": "MID", "purchase_price": 75, "current_price": 75, "team": "WHU"},
     ]
     player_pool = [
-        {"id": 101, "name": "Palmer", "position": "MID", "cost": 105, "chance_of_playing": 100},
-        {"id": 102, "name": "Isak", "position": "FWD", "cost": 85, "chance_of_playing": 100},
-        {"id": 103, "name": "Raya", "position": "GKP", "cost": 55, "chance_of_playing": 100},
-        {"id": 104, "name": "Saliba", "position": "DEF", "cost": 60, "chance_of_playing": 100},
-        {"id": 105, "name": "Mbeumo", "position": "MID", "cost": 75, "chance_of_playing": 100},
+        {"id": 101, "name": "Palmer", "position": "MID", "cost": 105, "chance_of_playing": 100, "team": "CHE"},
+        {"id": 102, "name": "Isak", "position": "FWD", "cost": 85, "chance_of_playing": 100, "team": "NEW"},
+        {"id": 103, "name": "Raya", "position": "GKP", "cost": 55, "chance_of_playing": 100, "team": "ARS"},
+        {"id": 104, "name": "Saliba", "position": "DEF", "cost": 60, "chance_of_playing": 100, "team": "ARS"},
+        {"id": 105, "name": "Mbeumo", "position": "MID", "cost": 75, "chance_of_playing": 100, "team": "BRE"},
     ]
     fixtures_data = {
         1: [{"expected_points": 3.2}, {"expected_points": 4.1}, {"expected_points": 2.5}],
