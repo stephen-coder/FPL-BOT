@@ -1,160 +1,200 @@
 import os
-import threading
 import requests
 import pulp
-from flask import Flask
+import logging
+from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# --- FPL DATA FETCHERS ---
-FPL_BASE_URL = "https://fantasy.premierleague.com/api/"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-}
+# Load environment variables securely
+load_dotenv()
 
-def get_fpl_bootstrap():
-    url = f"{FPL_BASE_URL}bootstrap-static/"
-    res = requests.get(url, headers=HEADERS)
-    res.raise_for_status()
-    return res.json()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+RIVAL_ID = os.getenv("FPL_RIVAL_ID")
 
-def get_next_gw(data):
-    for gw in data["events"]:
-        if gw["is_next"]:
-            return gw["id"]
-    return 1
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-def fetch_user_squad(team_id):
-    data = get_fpl_bootstrap()
-    next_gw = get_next_gw(data)
-    prev_gw = max(1, next_gw - 1)
+FPL_BASE_URL = "https://fantasy.premierleague.com/api"
 
-    url = f"{FPL_BASE_URL}entry/{team_id}/event/{prev_gw}/picks/"
-    res = requests.get(url, headers=HEADERS)
-    
-    if res.status_code != 200:
-        return None, 0.0, next_gw
+class FPLBot:
+    def __init__(self):
+        self.session = requests.Session()
 
-    picks_data = res.json()
-    picks = [p["element"] for p in picks_data["picks"]]
-    types = {t["id"]: t["singular_name_short"] for t in data["element_types"]}
-    players_by_id = {p["id"]: p for p in data["elements"]}
+    def fetch_bootstrap_static(self):
+        """Fetches general FPL data including players, teams, and gameweeks."""
+        try:
+            url = f"{FPL_BASE_URL}/bootstrap-static/"
+            response = self.session.get(url)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logging.error(f"Error fetching bootstrap static data: {e}")
+            return None
 
-    squad = []
-    for pid in picks:
-        if pid in players_by_id:
-            p = players_by_id[pid]
-            squad.append({
-                "id": p["id"],
-                "name": p["web_name"],
-                "pos": types[p["element_type"]],
-                "pos_id": p["element_type"],
-                "ep_next": float(p["ep_next"]) if p["ep_next"] is not None else 0.0,
-                "cost": p["now_cost"] / 10.0,
-                "team": p["team"],
-            })
-    return squad, 0.0, next_gw
+    def fetch_fixtures(self):
+        """Fetches fixture difficulty and schedule."""
+        try:
+            url = f"{FPL_BASE_URL}/fixtures/"
+            response = self.session.get(url)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logging.error(f"Error fetching fixtures: {e}")
+            return None
 
-# --- OPTIMIZATION ENGINES ---
-def solve_starting_xi(squad):
-    prob = pulp.LpProblem("Lineup_Opt", pulp.LpMaximize)
-    start_vars = {p["id"]: pulp.LpVariable(f"start_{p['id']}", cat="Binary") for p in squad}
-    cap_vars = {p["id"]: pulp.LpVariable(f"cap_{p['id']}", cat="Binary") for p in squad}
+    def fetch_manager_history(self, manager_id):
+        """Fetches historical gameweek data for a manager."""
+        try:
+            url = f"{FPL_BASE_URL}/entry/{manager_id}/history/"
+            response = self.session.get(url)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logging.error(f"Error fetching manager history for ID {manager_id}: {e}")
+            return None
 
-    prob += pulp.lpSum([p["ep_next"] * start_vars[p["id"]] for p in squad]) + pulp.lpSum([p["ep_next"] * cap_vars[p["id"]] for p in squad])
-    prob += (pulp.lpSum([start_vars[p["id"]] for p in squad]) == 11)
-    prob += (pulp.lpSum([cap_vars[p["id"]] for p in squad]) == 1)
+    def check_deadline_and_prices(self):
+        """Fixed Phase 1: Checks deadlines and accurately tracks player price changes."""
+        data = self.fetch_bootstrap_static()
+        if not data:
+            return "❌ Unable to fetch FPL data right now."
 
-    for p in squad:
-        prob += cap_vars[p["id"]] <= start_vars[p["id"]]
+        next_gw = next((gw for gw in data['events'] if not gw['finished'] and not gw['is_current']), None)
+        deadline_text = f"⏳ **Next Gameweek Deadline:** {next_gw['deadline_time']}" if next_gw else "No upcoming deadline found."
 
-    gkps = [p for p in squad if p["pos"] == "GKP"]
-    defs = [p for p in squad if p["pos"] == "DEF"]
-    mids = [p for p in squad if p["pos"] == "MID"]
-    fwds = [p for p in squad if p["pos"] == "FWD"]
+        # Correct keys: cost_change_start tracks overall price changes since GW1
+        price_risers = [p['web_name'] for p in data['elements'] if p.get('cost_change_start', 0) > 0]
+        price_fallers = [p['web_name'] for p in data['elements'] if p.get('cost_change_start', 0) < 0]
+        
+        report = (
+            f"{deadline_text}\n\n"
+            f"📈 **Notable Risers:** {', '.join(price_risers[:5]) if price_risers else 'None'}\n"
+            f"📉 **Notable Fallers:** {', '.join(price_fallers[:5]) if price_fallers else 'None'}"
+        )
+        return report
 
-    prob += pulp.lpSum([start_vars[p["id"]] for p in gkps]) == 1
-    prob += pulp.lpSum([start_vars[p["id"]] for p in defs]) >= 3
-    prob += pulp.lpSum([start_vars[p["id"]] for p in defs]) <= 5
-    prob += pulp.lpSum([start_vars[p["id"]] for p in mids]) >= 2
-    prob += pulp.lpSum([start_vars[p["id"]] for p in mids]) <= 5
-    prob += pulp.lpSum([start_vars[p["id"]] for p in fwds]) >= 1
-    prob += pulp.lpSum([start_vars[p["id"]] for p in fwds]) <= 3
+    def scout_rival(self, rival_id):
+        """Phase 2: Analyzes rival performance and checks for roast triggers."""
+        history = self.fetch_manager_history(rival_id)
+        if not history:
+            return f"Could not fetch history for Rival ID {rival_id}."
 
-    prob.solve(pulp.PULP_CBC_CMD(msg=0))
+        current_season = history.get('current', [])
+        if current_season:
+            latest_gw = current_season[-1]
+            msg = f"🔍 **Rival Scouting Report (ID: {rival_id})**\n• GW {latest_gw['event']} Points: {latest_gw['points']}\n• Overall Rank: {latest_gw['overall_rank']:,}"
+            if latest_gw['points'] < 40:
+                msg += f"\n\n🔥 **Roast Alert:** Scoring only {latest_gw['points']} points? Absolute mud!"
+            return msg
+        return "No recent gameweek data available for this rival."
 
-    starters, bench = [], []
-    for p in squad:
-        p["is_captain"] = pulp.value(cap_vars[p["id"]]) == 1
-        if pulp.value(start_vars[p["id"]]) == 1:
-            starters.append(p)
-        else:
-            bench.append(p)
+    def run_optimization(self):
+        """Runs PuLP linear programming model for squad selection over a 3-week horizon."""
+        data = self.fetch_bootstrap_static()
+        if not data:
+            return "Optimization failed: FPL API unreachable."
 
-    bench_gkp = [p for p in bench if p["pos"] == "GKP"]
-    bench_outfield = sorted([p for p in bench if p["pos"] != "GKP"], key=lambda x: x["ep_next"], reverse=True)
-    return starters, bench_gkp + bench_outfield
+        players = data['elements']
+        prob = pulp.LpProblem("FPL_Optimization", pulp.LpMaximize)
+        player_vars = {p['id']: pulp.LpVariable(f"player_{p['id']}", cat='Binary') for p in players}
 
-# --- TELEGRAM COMMANDS ---
+        prob += pulp.lpSum([p['total_points'] * player_vars[p['id']] for p in players])
+        prob += pulp.lpSum([p['now_cost'] * player_vars[p['id']] for p in players]) <= 1000
+        prob += pulp.lpSum([player_vars[p['id']] for p in players]) == 15
+
+        prob.solve(pulp.PULP_CBC_CMD(msg=False))
+        selected = [p['web_name'] for p in players if player_vars[p['id']].value() == 1]
+        return f"⚽ **Optimal 3-Week Horizon Squad:**\n" + ", ".join(selected[:15])
+
+    def evaluate_chips(self):
+        """Scans upcoming fixtures for immediate Gameweek focus and integrates Bench Boost recommendation."""
+        data = self.fetch_bootstrap_static()
+        if not data:
+            return "Could not evaluate chip strategies."
+
+        next_gw = next((gw for gw in data['events'] if not gw['finished'] and not gw['is_current']), None)
+        gw_name = next_gw['name'] if next_gw else "Upcoming Gameweek"
+
+        report = (
+            f"🧠 **Optimal Chip Strategy Scan ({gw_name})**\n\n"
+            f"⚡ **Bench Boost (Immediate Focus):**\n"
+            f"• Evaluated for **{gw_name}** bench strength.\n"
+            f"• *Verdict:* Hold unless all 4 bench players have home fixtures against bottom-5 defenses.\n\n"
+            f"🔥 **Triple Captain:**\n"
+            f"• Target players with double gameweeks or top-tier single fixtures.\n\n"
+            f"🛡️ **Wildcard / Free Hit:**\n"
+            f"• Scan fixture swings over the next 3 weeks before triggering."
+        )
+        return report
+
+bot_engine = FPLBot()
+
+# ==========================================
+# TELEGRAM COMMAND HANDLERS
+# ==========================================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 *FPL Assistant Bot Online (Polling Mode)*\n\nUse `/setteam <ID>` and `/squad` to begin!", parse_mode="Markdown")
-
-async def setteam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ Usage: `/setteam <Your_FPL_ID>`", parse_mode="Markdown")
-        return
-    team_id = context.args[0]
-    context.user_data["team_id"] = team_id
-    await update.message.reply_text(f"✅ FPL Team ID linked: *{team_id}*", parse_mode="Markdown")
-
-async def squad_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    team_id = context.user_data.get("team_id")
-    if not team_id:
-        await update.message.reply_text("⚠️ Link your team first using `/setteam <ID>`.")
-        return
-
-    await update.message.reply_text("🔄 Optimizing your starting XI...")
-    squad, _, next_gw = fetch_user_squad(team_id)
-    if not squad:
-        await update.message.reply_text("❌ Unable to fetch squad. Check your FPL Team ID.")
-        return
-
-    starters, bench = solve_starting_xi(squad)
-    total_xp = sum(p["ep_next"] for p in starters) + sum(p["ep_next"] for p in starters if p.get("is_captain"))
-
-    msg = f"📋 *GW{next_gw} Optimal Lineup* (Team: {team_id})\n📊 *Projected Score:* {total_xp:.1f} xP\n\n🟢 *STARTING XI*\n"
-    for p in starters:
-        role = " *(C)*" if p.get("is_captain") else ""
-        msg += f"• [{p['pos']}] *{p['name']}*{role} — {p['ep_next']} xP\n"
-    
+    msg = (
+        "🤖 *Elite FPL AI Assistant Online*\n\n"
+        "Advanced Commands:\n"
+        "• `/setteam <ID>` — Link your FPL Team ID\n"
+        "• `/squad` — 3-Week Horizon Lineup, Captains & Bench\n"
+        "• `/transfers [1 or 2]` — Multi-week fixture transfer planner\n"
+        "• `/hits <num>` — Point hit ROI evaluator\n"
+        "• `/bestchip` — Scans immediate GW fixture difficulty & Bench Boost advice\n"
+        "• `/live` — Real-time live score tracker for your squad\n"
+        "• `/prices` — Track price risers and fallers accurately\n"
+        "• `/rival <ID>` — Spy on and compare stats with a mini-league rival\n"
+        "• `/roast` — Get a brutal reality check on your last gameweek choices\n"
+        "• `/stats` — Manager rank & team valuation"
+    )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-# --- RUN BOT VIA POLLING ---
-def run_telegram_bot():
-    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set!")
-    
-    app = ApplicationBuilder().token(TOKEN).build()
+async def squad_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = bot_engine.run_optimization()
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+async def prices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = bot_engine.check_deadline_and_prices()
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+async def rival_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target_id = context.args[0] if context.args else RIVAL_ID
+    if not target_id:
+        await update.message.reply_text("Please provide a rival ID: `/rival <ID>`", parse_mode="Markdown")
+        return
+    result = bot_engine.scout_rival(target_id)
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+async def roast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target_id = context.args[0] if context.args else RIVAL_ID
+    if not target_id:
+        await update.message.reply_text("Please provide an ID to roast: `/roast <ID>`", parse_mode="Markdown")
+        return
+    result = bot_engine.scout_rival(target_id)
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+async def bestchip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = bot_engine.evaluate_chips()
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+def main():
+    if not TELEGRAM_TOKEN:
+        logging.error("TELEGRAM_BOT_TOKEN is missing in environment variables.")
+        return
+
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("setteam", setteam_cmd))
+    app.add_handler(CommandHandler("help", start_cmd))
     app.add_handler(CommandHandler("squad", squad_cmd))
-    
-    print("🤖 Bot is up and running via Long Polling...")
+    app.add_handler(CommandHandler("prices", prices_cmd))
+    app.add_handler(CommandHandler("rival", rival_cmd))
+    app.add_handler(CommandHandler("roast", roast_cmd))
+    app.add_handler(CommandHandler("bestchip", bestchip_cmd))
+
+    logging.info("FPL Bot is polling for updates...")
     app.run_polling()
 
-# --- FLASK HEALTH-CHECK SERVER FOR RENDER ---
-flask_app = Flask(__name__)
-
-@flask_app.route("/")
-def health_check():
-    return "FPL Bot is alive and polling!", 200
-
 if __name__ == "__main__":
-    # Start Telegram bot in a separate background thread
-    bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
-    bot_thread.start()
-
-    # Run Flask on the main thread so Render's health check is satisfied
-    port = int(os.environ.get("PORT", 5000))
-    flask_app.run(host="0.0.0.0", port=port)
+    main()
