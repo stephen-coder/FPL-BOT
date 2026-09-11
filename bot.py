@@ -101,13 +101,13 @@ class FPLBot:
             await update.message.reply_text("⚠️ Team ID saved, but could not verify details from FPL API. Check if the ID is correct.")
 
     async def squad(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Optimizes and evaluates the user's actual linked 15-player FPL squad for the upcoming gameweek."""
+        """Optimizes and evaluates the user's actual linked 15-player FPL squad for the immediate next gameweek."""
         team_id = context.user_data.get('team_id')
         if not team_id:
             await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
             return
 
-        await update.message.reply_text("⏳ Fetching your squad and analyzing the upcoming gameweek fixtures...")
+        await update.message.reply_text("⏳ Fetching your squad and analyzing the upcoming gameweek...")
 
         data = self.fetch_bootstrap_static()
         fixtures = self.fetch_fixtures()
@@ -144,16 +144,17 @@ class FPLBot:
             
             fdr = team_gw_fdr.get(p_info['team'], 3)
             form = float(p_info.get('form', 0) or 0)
+            ep = float(p_info.get('ep_next', 0) or 0)  # Next GW expected points
             status = p_info.get('status', 'a')
             chance = p_info.get('chance_of_playing_next_round', 100) or 100
 
             penalty = 0 if (status == 'a' and chance >= 75) else 15
-            score = (form * 4) - (fdr * 1.5) - penalty
+            score = (ep * 2.0) + (form * 1.5) - (fdr * 1.0) - penalty
 
             squad_pool.append({
                 'id': pid,
                 'name': p_info['web_name'],
-                'element_type': p_info['element_type'],
+                'element_type': p_info['element_type'],  # 1: GKP, 2: DEF, 3: MID, 4: FWD
                 'now_cost': p_info['now_cost'] / 10.0,
                 'status': status,
                 'chance': chance,
@@ -161,18 +162,24 @@ class FPLBot:
                 'fdr': fdr
             })
 
+        # Separate by position
         gkps = sorted([p for p in squad_pool if p['element_type'] == 1], key=lambda x: x['score'], reverse=True)
         defs = sorted([p for p in squad_pool if p['element_type'] == 2], key=lambda x: x['score'], reverse=True)
         mids = sorted([p for p in squad_pool if p['element_type'] == 3], key=lambda x: x['score'], reverse=True)
         fwds = sorted([p for p in squad_pool if p['element_type'] == 4], key=lambda x: x['score'], reverse=True)
 
-        starting_xi = [gkps[0]] + defs[:3] + mids[:3] + fwds[:1]
-        remaining_pool = gkps[1:] + defs[3:] + mids[3:] + fwds[1:]
-        remaining_pool.sort(key=lambda x: x['score'], reverse=True)
+        # Enforce valid formation (1 GKP, min 3 DEF, min 2 MID, min 1 FWD)
+        starting_xi = [gkps[0]] + defs[:3] + mids[:2] + fwds[:1]
+        
+        # Remaining spots to fill starting XI up to 11 players from best available bench players
+        bench_pool = gkps[1:] + defs[3:] + mids[2:] + fwds[1:]
+        bench_pool.sort(key=lambda x: x['score'], reverse=True)
 
-        starting_xi.extend(remaining_pool[:11 - len(starting_xi)])
-        bench = remaining_pool[11 - len(starting_xi):]
+        needed = 11 - len(starting_xi)
+        starting_xi.extend(bench_pool[:needed])
+        bench = bench_pool[needed:]
 
+        # Sort starting XI cleanly by position (GKP -> DEF -> MID -> FWD)
         pos_order = {1: 1, 2: 2, 3: 3, 4: 4}
         starting_xi.sort(key=lambda x: (pos_order[x['element_type']], -x['score']))
 
@@ -181,15 +188,15 @@ class FPLBot:
 
         report = [
             f"⚽ **Optimal Lineup & Squad Analysis (Gameweek {target_gw})**\n",
-            "🛡️ **Starting XI:**"
+            "🟢 **STARTING XI:**"
         ]
         for p in starting_xi:
             warn = " ⚠️ [Doubt]" if p['status'] != 'a' or p['chance'] < 75 else ""
             report.append(f"• {p['name']} (£{p['now_cost']}m) — FDR: {p['fdr']}{warn}")
 
-        report.append("\n🪑 **Bench:**")
-        for p in bench:
-            report.append(f"• {p['name']} (£{p['now_cost']}m)")
+        report.append("\n🪑 **BENCH:**")
+        for idx, p in enumerate(bench, 1):
+            report.append(f"{idx}. {p['name']} (£{p['now_cost']}m)")
 
         report.append(f"\n⭐ **Recommended Captain:** {best_captain['name']}")
         report.append(f"🥈 **Recommended Vice-Captain:** {best_vc['name']}")
@@ -224,11 +231,11 @@ class FPLBot:
             status = p.get('status', 'a')
             chance = p.get('chance_of_playing_next_round', 100) or 100
             if status != 'a' or chance < 75:
-                continue # Skip injured/suspended players for Free Hit
+                continue  # Skip injured/suspended players for Free Hit
 
             fdr = team_gw_fdr.get(p['team'], 3)
             form = float(p.get('form', 0) or 0)
-            ep = float(p.get('ep_next', 0) or 0) # Expected points next round
+            ep = float(p.get('ep_next', 0) or 0)
 
             score = (ep * 3) + (form * 2) - (fdr * 1.5)
             scored_pool.append({
@@ -239,17 +246,15 @@ class FPLBot:
                 'fdr': fdr
             })
 
-        # Sort position pools by score
         gkps = sorted([p for p in scored_pool if p['element_type'] == 1], key=lambda x: x['score'], reverse=True)
         defs = sorted([p for p in scored_pool if p['element_type'] == 2], key=lambda x: x['score'], reverse=True)
         mids = sorted([p for p in scored_pool if p['element_type'] == 3], key=lambda x: x['score'], reverse=True)
         fwds = sorted([p for p in scored_pool if p['element_type'] == 4], key=lambda x: x['score'], reverse=True)
 
-        # Pick ideal 15 (2 GK, 5 DEF, 5 MID, 3 FWD)
         fh_squad = gkps[:2] + defs[:5] + mids[:5] + fwds[:3]
         total_cost = sum(p['cost'] for p in fh_squad)
 
-        starting_xi = [gkps[0]] + defs[:3] + mids[:4] + fwds[:2] # Standard 3-4-3 or balanced
+        starting_xi = [gkps[0]] + defs[:3] + mids[:4] + fwds[:2]
         captain = max(starting_xi, key=lambda x: x['score'])
 
         report = [
@@ -294,7 +299,6 @@ class FPLBot:
         for p in players:
             p['projected_pts'] = float(p.get('ep_next', 0) or 0) + (float(p.get('form', 0) or 0) * 0.5)
 
-        # Sort by projected points
         players.sort(key=lambda x: x['projected_pts'], reverse=True)
 
         top_mids = [p for p in players if p['element_type'] == 3][:3]
@@ -350,7 +354,7 @@ def main():
     bot_app = FPLBot()
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Register command handlers
+    # Register active command handlers
     app.add_handler(CommandHandler("start", bot_app.start))
     app.add_handler(CommandHandler("setteam", bot_app.set_team))
     app.add_handler(CommandHandler("squad", bot_app.squad))
@@ -362,7 +366,7 @@ def main():
     for cmd in ["transfers", "hits", "bestchip", "benchboost", "triplecaptain", "live", "prices", "rival", "roast"]:
         app.add_handler(CommandHandler(cmd, bot_app.not_implemented))
 
-    print("🤖 FPL Bot is running with Free Hit & Scout capabilities...")
+    print("🤖 FPL Bot is running successfully...")
     app.run_polling()
 
 if __name__ == "__main__":
