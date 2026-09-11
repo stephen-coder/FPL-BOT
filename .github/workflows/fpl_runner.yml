@@ -13,6 +13,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 RIVAL_ID = os.getenv("FPL_RIVAL_ID")
 
+LINKED_TEAMS = {}
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 FPL_BASE_URL = "https://fantasy.premierleague.com/api"
@@ -43,6 +45,28 @@ class FPLBot:
             logging.error(f"Error fetching fixtures: {e}")
             return None
 
+    def fetch_manager_picks(self, team_id, gameweek):
+        """Fetches a manager's active squad picks for a given gameweek."""
+        try:
+            url = f"{FPL_BASE_URL}/entry/{team_id}/event/{gameweek}/picks/"
+            response = self.session.get(url)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logging.error(f"Error fetching picks for team {team_id} in GW {gameweek}: {e}")
+            return None
+
+    def fetch_live_scores(self, gameweek):
+        """Fetches live gameweek points and stats for all players."""
+        try:
+            url = f"{FPL_BASE_URL}/event/{gameweek}/live/"
+            response = self.session.get(url)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logging.error(f"Error fetching live scores for GW {gameweek}: {e}")
+            return None
+
     def fetch_manager_history(self, manager_id):
         """Fetches historical gameweek data for a manager."""
         try:
@@ -55,7 +79,7 @@ class FPLBot:
             return None
 
     def check_deadline_and_prices(self):
-        """Fixed Phase 1: Checks deadlines and accurately tracks player price changes."""
+        """Checks deadlines and tracks player price changes."""
         data = self.fetch_bootstrap_static()
         if not data:
             return "❌ Unable to fetch FPL data right now."
@@ -63,7 +87,6 @@ class FPLBot:
         next_gw = next((gw for gw in data['events'] if not gw['finished'] and not gw['is_current']), None)
         deadline_text = f"⏳ **Next Gameweek Deadline:** {next_gw['deadline_time']}" if next_gw else "No upcoming deadline found."
 
-        # Correct keys: cost_change_start tracks overall price changes since GW1
         price_risers = [p['web_name'] for p in data['elements'] if p.get('cost_change_start', 0) > 0]
         price_fallers = [p['web_name'] for p in data['elements'] if p.get('cost_change_start', 0) < 0]
         
@@ -74,8 +97,52 @@ class FPLBot:
         )
         return report
 
+    def get_live_tracker(self, team_id):
+        """Tracks live points and performance for a linked FPL team."""
+        data = self.fetch_bootstrap_static()
+        if not data:
+            return "❌ FPL API unreachable."
+
+        current_gw = next((gw['id'] for gw in data['events'] if gw['is_current']), None)
+        if not current_gw:
+            current_gw = next((gw['id'] for gw in data['events'] if gw['finished'] == False), 1)
+
+        picks_data = self.fetch_manager_picks(team_id, current_gw)
+        if not picks_data:
+            return f"❌ Could not retrieve squad picks for Team ID {team_id} in GW {current_gw}."
+
+        live_data = self.fetch_live_scores(current_gw)
+        live_elements = {item['id']: item['stats'] for item in live_data['elements']} if live_data else {}
+        players_meta = {p['id']: p['web_name'] for p in data['elements']}
+
+        total_live_points = 0
+        squad_report = [f"🔴 **Live Tracker - Gameweek {current_gw}** (Team ID: {team_id})\n"]
+
+        for pick in picks_data.get('picks', []):
+            pid = pick['element']
+            name = players_meta.get(pid, f"Player {pid}")
+            multiplier = pick['multiplier']
+            is_captain = pick['is_captain']
+            is_vc = pick['is_vice_captain']
+            
+            stats = live_elements.get(pid, {'total_points': 0})
+            pts = stats.get('total_points', 0)
+            adjusted_pts = pts * multiplier
+            total_live_points += adjusted_pts
+
+            badge = " (C)" if is_captain else (" (VC)" if is_vc else "")
+            status_line = f"• {name}{badge}: {pts} pts" + (f" [x{multiplier} = {adjusted_pts}]" if multiplier > 1 else "")
+            
+            if pick['position'] <= 11:
+                squad_report.append(status_line)
+            else:
+                squad_report.append(f"   *(Bench)* {status_line}")
+
+        squad_report.insert(1, f"🏆 **Total Live Points: {total_live_points}**\n")
+        return "\n".join(squad_report)
+
     def scout_rival(self, rival_id):
-        """Phase 2: Analyzes rival performance and checks for roast triggers."""
+        """Analyzes rival performance and checks for roast triggers."""
         history = self.fetch_manager_history(rival_id)
         if not history:
             return f"Could not fetch history for Rival ID {rival_id}."
@@ -107,24 +174,39 @@ class FPLBot:
         selected = [p['web_name'] for p in players if player_vars[p['id']].value() == 1]
         return f"⚽ **Optimal 3-Week Horizon Squad:**\n" + ", ".join(selected[:15])
 
-    def evaluate_chips(self):
-        """Scans upcoming fixtures for immediate Gameweek focus and integrates Bench Boost recommendation."""
+    def evaluate_chips_season_long(self):
+        """Scans the entire season schedule to recommend the best gameweek to deploy each chip."""
         data = self.fetch_bootstrap_static()
-        if not data:
-            return "Could not evaluate chip strategies."
+        fixtures = self.fetch_fixtures()
+        if not data or not fixtures:
+            return "❌ Could not retrieve season data for chip analysis."
 
-        next_gw = next((gw for gw in data['events'] if not gw['finished'] and not gw['is_current']), None)
-        gw_name = next_gw['name'] if next_gw else "Upcoming Gameweek"
+        events = [gw for gw in data['events'] if not gw['finished']]
+        if not events:
+            return "No remaining gameweeks found."
+
+        # Analyze fixtures per gameweek to find Double Gameweeks (DGW) or easy fixture clusters
+        gw_fixture_counts = {}
+        for f in fixtures:
+            if f['event'] is not None:
+                gw_fixture_counts[f['event']] = gw_fixture_counts.get(f['event'], 0) + 1
+
+        # Find potential DGWs (where total matches across all teams are unusually high)
+        dgw_candidates = [gw_id for gw_id, count in gw_fixture_counts.items() if count > 10]
+
+        target_tc_gw = dgw_candidates[0] if dgw_candidates else events[min(5, len(events)-1)]['id']
+        target_bb_gw = dgw_candidates[1] if len(dgw_candidates) > 1 else events[min(10, len(events)-1)]['id']
 
         report = (
-            f"🧠 **Optimal Chip Strategy Scan ({gw_name})**\n\n"
-            f"⚡ **Bench Boost (Immediate Focus):**\n"
-            f"• Evaluated for **{gw_name}** bench strength.\n"
-            f"• *Verdict:* Hold unless all 4 bench players have home fixtures against bottom-5 defenses.\n\n"
-            f"🔥 **Triple Captain:**\n"
-            f"• Target players with double gameweeks or top-tier single fixtures.\n\n"
+            f"🎯 **Season-Long Optimal Chip Strategy Recommendation**\n\n"
+            f"⚡ **Bench Boost (BB):**\n"
+            f"• Recommended Target: **Gameweek {target_bb_gw}**\n"
+            f"• *Reason:* Aligns with expected Double Gameweek fixture congestion where squad depth maximizes returns.\n\n"
+            f"🔥 **Triple Captain (TC):**\n"
+            f"• Recommended Target: **Gameweek {target_tc_gw}**\n"
+            f"• *Reason:* Best projected single/double fixture window for premium assets.\n\n"
             f"🛡️ **Wildcard / Free Hit:**\n"
-            f"• Scan fixture swings over the next 3 weeks before triggering."
+            f"• Recommended Target: Save for major fixture swings around blank/double gameweek announcements later in the season."
         )
         return report
 
@@ -138,17 +220,35 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 *Elite FPL AI Assistant Online*\n\n"
         "Advanced Commands:\n"
         "• `/setteam <ID>` — Link your FPL Team ID\n"
-        "• `/squad` — 3-Week Horizon Lineup, Captains & Bench\n"
-        "• `/transfers [1 or 2]` — Multi-week fixture transfer planner\n"
-        "• `/hits <num>` — Point hit ROI evaluator\n"
-        "• `/bestchip` — Scans immediate GW fixture difficulty & Bench Boost advice\n"
+        "• `/squad` — View optimal 3-week horizon squad\n"
         "• `/live` — Real-time live score tracker for your squad\n"
-        "• `/prices` — Track price risers and fallers accurately\n"
-        "• `/rival <ID>` — Spy on and compare stats with a mini-league rival\n"
-        "• `/roast` — Get a brutal reality check on your last gameweek choices\n"
-        "• `/stats` — Manager rank & team valuation"
+        "• `/prices` — Track price risers and fallers\n"
+        "• `/bestchip` — Season-long optimal chip deployment analyzer\n"
+        "• `/rival <ID>` — Spy on and compare stats with a rival\n"
+        "• `/roast <ID>` — Get a reality check on gameweek scores\n"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def setteam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("⚠️ Please provide your Team ID. Example: `/setteam 1234567`", parse_mode="Markdown")
+        return
+    
+    team_id = context.args[0]
+    chat_id = update.effective_chat.id
+    LINKED_TEAMS[chat_id] = team_id
+    await update.message.reply_text(f"✅ Successfully linked FPL Team ID **{team_id}** to this chat!", parse_mode="Markdown")
+
+async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    team_id = context.args[0] if context.args else LINKED_TEAMS.get(chat_id)
+    
+    if not team_id:
+        await update.message.reply_text("⚠️ No team linked yet. Use `/setteam <ID>` or pass your ID: `/live <ID>`", parse_mode="Markdown")
+        return
+
+    result = bot_engine.get_live_tracker(team_id)
+    await update.message.reply_text(result, parse_mode="Markdown")
 
 async def squad_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = bot_engine.run_optimization()
@@ -175,7 +275,7 @@ async def roast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(result, parse_mode="Markdown")
 
 async def bestchip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    result = bot_engine.evaluate_chips()
+    result = bot_engine.evaluate_chips_season_long()
     await update.message.reply_text(result, parse_mode="Markdown")
 
 def main():
@@ -187,13 +287,15 @@ def main():
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", start_cmd))
+    app.add_handler(CommandHandler("setteam", setteam_cmd))
+    app.add_handler(CommandHandler("live", live_cmd))
     app.add_handler(CommandHandler("squad", squad_cmd))
     app.add_handler(CommandHandler("prices", prices_cmd))
     app.add_handler(CommandHandler("rival", rival_cmd))
     app.add_handler(CommandHandler("roast", roast_cmd))
     app.add_handler(CommandHandler("bestchip", bestchip_cmd))
 
-    logging.info("FPL Bot is polling for updates...")
+    logging.info("FPL Bot is polling with Season-Long Chip Analysis...")
     app.run_polling()
 
 if __name__ == "__main__":
