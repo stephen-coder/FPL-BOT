@@ -546,7 +546,8 @@ async def hits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             num_hits = 1
 
-    # Each extra transfer costs 4 points
+    # Total transfers allowed = 1 free transfer + num_hits extra transfers
+    total_transfers = 1 + num_hits
     cost_in_points = num_hits * 4
 
     await update.message.reply_text(
@@ -558,21 +559,21 @@ async def hits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Unable to fetch squad.")
         return
 
-    # Evaluate optimal transfers for (1 free transfer + num_hits extra transfers)
+    # Pass the total calculated transfers to solve_transfers safely
     swaps, remaining_bank, total_gain = solve_transfers(
-        squad, bank, num_transfers=1 + num_hits
+        squad, bank, num_transfers=total_transfers
     )
 
     if not swaps:
         await update.message.reply_text(
-            f"❌ Could not find valid transfers for {1 + num_hits} moves."
+            f"❌ Could not find valid transfers for {total_transfers} moves."
         )
         return
 
     net_gain = total_gain - cost_in_points
     is_worth_it = net_gain > 0
 
-    msg = f"⚖️ *TRANSFER HIT ANALYSIS (GW{next_gw})\n\n"
+    msg = f"⚖️ *TRANSFER HIT ANALYSIS (GW{next_gw})*\n\n"
     msg += f"• Extra Transfers / Hit Cost: *{num_hits} (-{cost_in_points} pts)*\n"
     msg += f"• Projected xP Gain from Transfers: *+{total_gain:.2f} xP*\n"
     msg += f"• Net Expected Gain: *{net_gain:+.2f} xP*\n\n"
@@ -584,7 +585,8 @@ async def hits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg += "🔄 *Proposed Moves:*\n"
     for out_p, in_p, gain in swaps:
-        msg += f"• OUT: {out_p['name']} | IN: {in_p.get('name', 'None')} (+{gain:.2f} xP)\n"
+        in_name = in_p.get('name', 'None') if in_p else 'None'
+        msg += f"• OUT: {out_p['name']} | IN: {in_name} (+{gain:.2f} xP)\n"
 
     await update.message.reply_text(msg, parse_mode="Markdown")
 
