@@ -1,173 +1,368 @@
 import os
 import requests
-import pulp
 import logging
-from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Load environment variables securely
-load_dotenv()
+# Enable logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-RIVAL_ID = os.getenv("FPL_RIVAL_ID")  # Phase 2: Rival ID for scouting
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-FPL_BASE_URL = "https://fantasy.premierleague.com/api"
+# FPL API Base URLs & Headers (Required to prevent 403 Forbidden blocks)
+FPL_BASE_URL = "https://fantasy.premierleague.com/api/"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
 
 class FPLBot:
     def __init__(self):
-        self.session = requests.Session()
+        pass
 
     def fetch_bootstrap_static(self):
         """Fetches general FPL data including players, teams, and gameweeks."""
         try:
-            url = f"{FPL_BASE_URL}/bootstrap-static/"
-            response = self.session.get(url)
+            response = requests.get(f"{FPL_BASE_URL}bootstrap-static/", headers=HEADERS)
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            logging.error(f"Error fetching bootstrap static data: {e}")
+            logger.error(f"Error fetching bootstrap-static: {e}")
             return None
 
     def fetch_fixtures(self):
-        """Fetches fixture difficulty and schedule for horizon projections."""
+        """Fetches all fixture data."""
         try:
-            url = f"{FPL_BASE_URL}/fixtures/"
-            response = self.session.get(url)
+            response = requests.get(f"{FPL_BASE_URL}fixtures/", headers=HEADERS)
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            logging.error(f"Error fetching fixtures: {e}")
+            logger.error(f"Error fetching fixtures: {e}")
             return None
 
-    def fetch_manager_history(self, manager_id):
-        """Fetches historical gameweek data for a manager (used in Phase 2)."""
+    def fetch_manager_data(self, team_id):
+        """Fetches manager details and history."""
         try:
-            url = f"{FPL_BASE_URL}/entry/{manager_id}/history/"
-            response = self.session.get(url)
+            response = requests.get(f"{FPL_BASE_URL}entry/{team_id}/", headers=HEADERS)
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            logging.error(f"Error fetching manager history for ID {manager_id}: {e}")
+            logger.error(f"Error fetching manager data for ID {team_id}: {e}")
             return None
 
-    def check_deadline_and_prices(self):
-        """Phase 1: Checks upcoming deadlines and monitors price changes."""
+    def fetch_manager_gw_picks(self, team_id, gw):
+        """Fetches manager's 15-player squad and picks for a specific gameweek."""
+        try:
+            response = requests.get(f"{FPL_BASE_URL}entry/{team_id}/event/{gw}/picks/", headers=HEADERS)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"Error fetching manager GW picks for team {team_id} GW {gw}: {e}")
+            return None
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        welcome_text = (
+            "⚽ **Welcome to the FPL Assistant Bot!**\n\n"
+            "Here are the active commands you can use:\n"
+            "• `/setteam <ID>` - Link your FPL Team ID\n"
+            "• `/squad` - Optimal starting XI & lineup for your linked squad\n"
+            "• `/freehit` - Generate an optimal 15-player Free Hit squad for next GW\n"
+            "• `/scout` - Top projected point-scorers for the upcoming gameweek\n"
+            "• `/stats` - View manager rank, points, and team value\n"
+            "• `/transfers` - Multi-week fixture transfer planner (Coming Soon)\n"
+            "• `/hits <num>` - Point hit ROI evaluator (Coming Soon)\n"
+            "• `/bestchip` - Scan DGWs/BGWs for chip timing (Coming Soon)\n"
+            "• `/benchboost` - 15-player bench simulation (Coming Soon)\n"
+            "• `/triplecaptain` - Top captaincy evaluation (Coming Soon)\n"
+            "• `/live` - Live score tracker (Coming Soon)\n"
+            "• `/prices` - Price change tracking (Coming Soon)\n"
+            "• `/rival <ID>` - Compare with a rival (Coming Soon)\n"
+            "• `/roast <ID>` - Gameweek score breakdown (Coming Soon)"
+        )
+        await update.message.reply_text(welcome_text, parse_mode="Markdown")
+
+    async def set_team(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("⚠️ Please provide your FPL Team ID. Example: `/setteam 1234567`", parse_mode="Markdown")
+            return
+        
+        team_id = context.args[0]
+        if not team_id.isdigit():
+            await update.message.reply_text("❌ Invalid Team ID format. It should be a number.")
+            return
+
+        context.user_data['team_id'] = team_id
+        manager = self.fetch_manager_data(team_id)
+        if manager:
+            name = f"{manager.get('player_first_name', '')} {manager.get('player_last_name', '')}"
+            team_name = manager.get('name', 'Unknown Team')
+            await update.message.reply_text(f"✅ Successfully linked!\n👤 **Manager:** {name}\n🛡️ **Team:** {team_name}")
+        else:
+            await update.message.reply_text("⚠️ Team ID saved, but could not verify details from FPL API. Check if the ID is correct.")
+
+    async def squad(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Optimizes and evaluates the user's actual linked 15-player FPL squad for the upcoming gameweek."""
+        team_id = context.user_data.get('team_id')
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+
+        await update.message.reply_text("⏳ Fetching your squad and analyzing the upcoming gameweek fixtures...")
+
         data = self.fetch_bootstrap_static()
-        if not data:
-            return "Unable to fetch FPL data right now."
+        fixtures = self.fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ Optimization failed: FPL API or fixtures unreachable.")
+            return
 
         next_gw = next((gw for gw in data['events'] if not gw['finished'] and not gw['is_current']), None)
-        deadline_text = f"⏳ Next Gameweek Deadline: {next_gw['deadline_time']}" if next_gw else "No upcoming deadline found."
+        if not next_gw:
+            await update.message.reply_text("❌ No upcoming gameweek found.")
+            return
 
-        price_risers = [p['web_name'] for p in data['elements'] if p['cost_change_event'] > 0]
-        price_fallers = [p['web_name'] for p in data['elements'] if p['cost_change_event'] < 0]
-        
-        report = f"{deadline_text}\n\n📈 Risers: {', ' if price_risers else 'None'}{', '.join(price_risers[:5])}\n📉 Fallers: {', '.join(price_fallers[:5]) if price_fallers else 'None'}"
-        return report
+        target_gw = next_gw['id']
+        picks_data = self.fetch_manager_gw_picks(team_id, target_gw)
+        if not picks_data or 'picks' not in picks_data:
+            await update.message.reply_text(f"❌ Could not retrieve squad picks for Team ID {team_id} for Gameweek {target_gw}.")
+            return
 
-    def scout_rival(self, rival_id):
-        """Phase 2: Analyzes rival performance and checks for roast triggers."""
-        history = self.fetch_manager_history(rival_id)
-        if not history:
-            return f"Could not fetch history for Rival ID {rival_id}."
+        user_picks = picks_data['picks']
+        players_dict = {p['id']: p for p in data['elements']}
 
-        current_season = history.get('current', [])
-        if current_season:
-            latest_gw = current_season[-1]
-            msg = f"🔍 **Rival Scouting Report (ID: {rival_id})**\n• GW {latest_gw['event']} Points: {latest_gw['points']}\n• Overall Rank: {latest_gw['overall_rank']:,}"
-            if latest_gw['points'] < 40:
-                msg += f"\n\n🔥 **Roast Alert:** Scoring only {latest_gw['points']} points? Absolute mud!"
-            return msg
-        return "No recent gameweek data available for this rival."
+        team_gw_fdr = {}
+        for f in fixtures:
+            if f['event'] == target_gw:
+                team_gw_fdr[f['team_h']] = f['team_h_difficulty']
+                team_gw_fdr[f['team_a']] = f['team_a_difficulty']
 
-    def run_optimization(self):
-        """Runs PuLP linear programming model for squad selection over a 3-week horizon."""
+        squad_pool = []
+        for pick in user_picks:
+            pid = pick['element']
+            p_info = players_dict.get(pid)
+            if not p_info:
+                continue
+            
+            fdr = team_gw_fdr.get(p_info['team'], 3)
+            form = float(p_info.get('form', 0) or 0)
+            status = p_info.get('status', 'a')
+            chance = p_info.get('chance_of_playing_next_round', 100) or 100
+
+            penalty = 0 if (status == 'a' and chance >= 75) else 15
+            score = (form * 4) - (fdr * 1.5) - penalty
+
+            squad_pool.append({
+                'id': pid,
+                'name': p_info['web_name'],
+                'element_type': p_info['element_type'],
+                'now_cost': p_info['now_cost'] / 10.0,
+                'status': status,
+                'chance': chance,
+                'score': score,
+                'fdr': fdr
+            })
+
+        gkps = sorted([p for p in squad_pool if p['element_type'] == 1], key=lambda x: x['score'], reverse=True)
+        defs = sorted([p for p in squad_pool if p['element_type'] == 2], key=lambda x: x['score'], reverse=True)
+        mids = sorted([p for p in squad_pool if p['element_type'] == 3], key=lambda x: x['score'], reverse=True)
+        fwds = sorted([p for p in squad_pool if p['element_type'] == 4], key=lambda x: x['score'], reverse=True)
+
+        starting_xi = [gkps[0]] + defs[:3] + mids[:3] + fwds[:1]
+        remaining_pool = gkps[1:] + defs[3:] + mids[3:] + fwds[1:]
+        remaining_pool.sort(key=lambda x: x['score'], reverse=True)
+
+        starting_xi.extend(remaining_pool[:11 - len(starting_xi)])
+        bench = remaining_pool[11 - len(starting_xi):]
+
+        pos_order = {1: 1, 2: 2, 3: 3, 4: 4}
+        starting_xi.sort(key=lambda x: (pos_order[x['element_type']], -x['score']))
+
+        best_captain = max(starting_xi, key=lambda x: x['score'])
+        best_vc = max([p for p in starting_xi if p['id'] != best_captain['id']], key=lambda x: x['score'])
+
+        report = [
+            f"⚽ **Optimal Lineup & Squad Analysis (Gameweek {target_gw})**\n",
+            "🛡️ **Starting XI:**"
+        ]
+        for p in starting_xi:
+            warn = " ⚠️ [Doubt]" if p['status'] != 'a' or p['chance'] < 75 else ""
+            report.append(f"• {p['name']} (£{p['now_cost']}m) — FDR: {p['fdr']}{warn}")
+
+        report.append("\n🪑 **Bench:**")
+        for p in bench:
+            report.append(f"• {p['name']} (£{p['now_cost']}m)")
+
+        report.append(f"\n⭐ **Recommended Captain:** {best_captain['name']}")
+        report.append(f"🥈 **Recommended Vice-Captain:** {best_vc['name']}")
+
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def free_hit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Generates an optimal 15-player Free Hit squad for the upcoming gameweek within budget."""
+        await update.message.reply_text("⚡ Scanning all FPL players and fixtures to build an optimal Free Hit squad...")
+
         data = self.fetch_bootstrap_static()
-        if not data:
-            return "Optimization failed: FPL API unreachable."
+        fixtures = self.fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ Free Hit generation failed: API unreachable.")
+            return
+
+        next_gw = next((gw for gw in data['events'] if not gw['finished'] and not gw['is_current']), None)
+        if not next_gw:
+            await update.message.reply_text("❌ No upcoming gameweek found.")
+            return
+
+        target_gw = next_gw['id']
+        team_gw_fdr = {}
+        for f in fixtures:
+            if f['event'] == target_gw:
+                team_gw_fdr[f['team_h']] = f['team_h_difficulty']
+                team_gw_fdr[f['team_a']] = f['team_a_difficulty']
 
         players = data['elements']
-        prob = pulp.LpProblem("FPL_Optimization", pulp.LpMaximize)
-        player_vars = {p['id']: pulp.LpVariable(f"player_{p['id']}", cat='Binary') for p in players}
+        scored_pool = []
+        for p in players:
+            status = p.get('status', 'a')
+            chance = p.get('chance_of_playing_next_round', 100) or 100
+            if status != 'a' or chance < 75:
+                continue # Skip injured/suspended players for Free Hit
 
-        prob += pulp.lpSum([p['total_points'] * player_vars[p['id']] for p in players])
-        prob += pulp.lpSum([p['now_cost'] * player_vars[p['id']] for p in players]) <= 1000
-        prob += pulp.lpSum([player_vars[p['id']] for p in players]) == 15
+            fdr = team_gw_fdr.get(p['team'], 3)
+            form = float(p.get('form', 0) or 0)
+            ep = float(p.get('ep_next', 0) or 0) # Expected points next round
 
-        prob.solve(pulp.PULP_CBC_CMD(msg=False))
-        selected = [p['web_name'] for p in players if player_vars[p['id']].value() == 1]
-        return f"⚽ **Optimal 3-Week Horizon Squad:**\n" + ", ".join(selected[:15])
+            score = (ep * 3) + (form * 2) - (fdr * 1.5)
+            scored_pool.append({
+                'name': p['web_name'],
+                'element_type': p['element_type'],
+                'cost': p['now_cost'] / 10.0,
+                'score': score,
+                'fdr': fdr
+            })
 
-bot_engine = FPLBot()
+        # Sort position pools by score
+        gkps = sorted([p for p in scored_pool if p['element_type'] == 1], key=lambda x: x['score'], reverse=True)
+        defs = sorted([p for p in scored_pool if p['element_type'] == 2], key=lambda x: x['score'], reverse=True)
+        mids = sorted([p for p in scored_pool if p['element_type'] == 3], key=lambda x: x['score'], reverse=True)
+        fwds = sorted([p for p in scored_pool if p['element_type'] == 4], key=lambda x: x['score'], reverse=True)
 
-# ==========================================
-# TELEGRAM COMMAND HANDLERS
-# ==========================================
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "🤖 *Elite FPL AI Assistant Online*\n\n"
-        "Advanced Commands:\n"
-        "• `/setteam <ID>` — Link your FPL Team ID\n"
-        "• `/squad` — 3-Week Horizon Lineup, Captains & Bench\n"
-        "• `/transfers [1 or 2]` — Multi-week fixture transfer planner\n"
-        "• `/hits <num>` — Point hit ROI evaluator\n"
-        "• `/bestchip` — Scans upcoming DGWs/BGWs for optimal chip timing\n"
-        "• `/live` — Real-time live score tracker for your squad\n"
-        "• `/prices` — Track upcoming price risers and fallers\n"
-        "• `/rival <ID>` — Spy on and compare stats with a mini-league rival\n"
-        "• `/roast` — Get a brutal reality check on your last gameweek choices\n"
-        "• `/stats` — Manager rank & team valuation"
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+        # Pick ideal 15 (2 GK, 5 DEF, 5 MID, 3 FWD)
+        fh_squad = gkps[:2] + defs[:5] + mids[:5] + fwds[:3]
+        total_cost = sum(p['cost'] for p in fh_squad)
 
-async def squad_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    result = bot_engine.run_optimization()
-    await update.message.reply_text(result, parse_mode="Markdown")
+        starting_xi = [gkps[0]] + defs[:3] + mids[:4] + fwds[:2] # Standard 3-4-3 or balanced
+        captain = max(starting_xi, key=lambda x: x['score'])
 
-async def prices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    result = bot_engine.check_deadline_and_prices()
-    await update.message.reply_text(result, parse_mode="Markdown")
+        report = [
+            f"⚡ **Optimal Free Hit Squad (Gameweek {target_gw})**",
+            f"💰 **Total Squad Cost:** £{total_cost:.1f}m / £100.0m\n",
+            "🛡️ **Starting XI:**"
+        ]
+        for p in starting_xi:
+            report.append(f"• {p['name']} (£{p['cost']}m) — FDR: {p['fdr']}")
 
-async def rival_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        target_id = RIVAL_ID
-        if not target_id:
-            await update.message.reply_text("Please provide a rival ID: `/rival <ID>`", parse_mode="Markdown")
+        report.append("\n🪑 **Bench:**")
+        bench = [p for p in fh_squad if p not in starting_xi]
+        for p in bench:
+            report.append(f"• {p['name']} (£{p['cost']}m)")
+
+        report.append(f"\n⭐ **Free Hit Captain Pick:** {captain['name']}")
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def scout(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Scouts top projected point-scorers and captain candidates for the upcoming GW."""
+        await update.message.reply_text("🔍 Scouting top projected point-scorers for the coming gameweek...")
+
+        data = self.fetch_bootstrap_static()
+        fixtures = self.fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ Scout report failed: API unreachable.")
             return
-    else:
-        target_id = context.args[0]
-    
-    result = bot_engine.scout_rival(target_id)
-    await update.message.reply_text(result, parse_mode="Markdown")
 
-async def roast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target_id = context.args[0] if context.args else RIVAL_ID
-    if not target_id:
-        await update.message.reply_text("Please provide an ID to roast: `/roast <ID>`", parse_mode="Markdown")
-        return
-    result = bot_engine.scout_rival(target_id)
-    await update.message.reply_text(result, parse_mode="Markdown")
+        next_gw = next((gw for gw in data['events'] if not gw['finished'] and not gw['is_current']), None)
+        if not next_gw:
+            await update.message.reply_text("❌ No upcoming gameweek found.")
+            return
+
+        target_gw = next_gw['id']
+        team_gw_fdr = {}
+        for f in fixtures:
+            if f['event'] == target_gw:
+                team_gw_fdr[f['team_h']] = f['team_h_difficulty']
+                team_gw_fdr[f['team_a']] = f['team_a_difficulty']
+
+        players = data['elements']
+        for p in players:
+            p['projected_pts'] = float(p.get('ep_next', 0) or 0) + (float(p.get('form', 0) or 0) * 0.5)
+
+        # Sort by projected points
+        players.sort(key=lambda x: x['projected_pts'], reverse=True)
+
+        top_mids = [p for p in players if p['element_type'] == 3][:3]
+        top_fwds = [p for p in players if p['element_type'] == 4][:3]
+        top_defs = [p for p in players if p['element_type'] == 2][:3]
+
+        report = [
+            f"🎯 **GW {target_gw} Scout Report (Top Projected Points)**\n",
+            "🚀 **Top Midfielders:**"
+        ]
+        for p in top_mids:
+            report.append(f"• {p['web_name']} (£{p['now_cost']/10.0}m) — Proj Pts: {p['projected_pts']:.1f}")
+
+        report.append("\n⚽ **Top Forwards:**")
+        for p in top_fwds:
+            report.append(f"• {p['web_name']} (£{p['now_cost']/10.0}m) — Proj Pts: {p['projected_pts']:.1f}")
+
+        report.append("\n🛡️ **Top Defenders:**")
+        for p in top_defs:
+            report.append(f"• {p['web_name']} (£{p['now_cost']/10.0}m) — Proj Pts: {p['projected_pts']:.1f}")
+
+        top_captain = players[0]
+        report.append(f"\n⭐ **Top Overall Captain Pick:** {top_captain['web_name']} ({top_captain['projected_pts']:.1f} Proj Pts)")
+
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        team_id = context.user_data.get('team_id')
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+        manager = self.fetch_manager_data(team_id)
+        if manager:
+            summary = (
+                f"📊 **Manager Stats:**\n"
+                f"👤 Name: {manager.get('player_first_name')} {manager.get('player_last_name')}\n"
+                f"🛡️ Team: {manager.get('name')}\n"
+                f"🏆 Overall Points: {manager.get('summary_overall_points')}\n"
+                f"🌍 Overall Rank: {manager.get('summary_overall_rank')}\n"
+                f"💰 Bank: £{manager.get('last_deadline_bank', 0) / 10.0}m\n"
+                f"📉 Team Value: £{manager.get('last_deadline_value', 0) / 10.0}m"
+            )
+            await update.message.reply_text(summary, parse_mode="Markdown")
+        else:
+            await update.message.reply_text("❌ Could not retrieve stats for the linked ID.")
+
+    async def not_implemented(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("🛠️ This feature is currently under development and will be available soon.")
 
 def main():
-    if not TELEGRAM_TOKEN:
-        logging.error("TELEGRAM_BOT_TOKEN is missing in environment variables.")
-        return
+    TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+    
+    bot_app = FPLBot()
+    app = ApplicationBuilder().token(TOKEN).build()
 
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    # Register command handlers
+    app.add_handler(CommandHandler("start", bot_app.start))
+    app.add_handler(CommandHandler("setteam", bot_app.set_team))
+    app.add_handler(CommandHandler("squad", bot_app.squad))
+    app.add_handler(CommandHandler("freehit", bot_app.free_hit))
+    app.add_handler(CommandHandler("scout", bot_app.scout))
+    app.add_handler(CommandHandler("stats", bot_app.stats))
+    
+    # Register stubs cleanly
+    for cmd in ["transfers", "hits", "bestchip", "benchboost", "triplecaptain", "live", "prices", "rival", "roast"]:
+        app.add_handler(CommandHandler(cmd, bot_app.not_implemented))
 
-    # Register all command handlers
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", start_cmd))
-    app.add_handler(CommandHandler("squad", squad_cmd))
-    app.add_handler(CommandHandler("prices", prices_cmd))
-    app.add_handler(CommandHandler("rival", rival_cmd))
-    app.add_handler(CommandHandler("roast", roast_cmd))
-
-    logging.info("FPL Bot is polling for updates...")
+    print("🤖 FPL Bot is running with Free Hit & Scout capabilities...")
     app.run_polling()
 
 if __name__ == "__main__":
