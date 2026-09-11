@@ -3,6 +3,8 @@ import requests
 import pulp
 import logging
 from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # Load environment variables securely
 load_dotenv()
@@ -13,7 +15,7 @@ RIVAL_ID = os.getenv("FPL_RIVAL_ID")  # Phase 2: Rival ID for scouting
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-FPL_BASE_URL = "https://fantasy.premier league.com/api"
+FPL_BASE_URL = "https://fantasy.premierleague.com/api"
 
 class FPLBot:
     def __init__(self):
@@ -52,99 +54,121 @@ class FPLBot:
             logging.error(f"Error fetching manager history for ID {manager_id}: {e}")
             return None
 
-    # ==========================================
-    # PHASE 1: Real-Time Engine & Safeguards
-    # ==========================================
     def check_deadline_and_prices(self):
         """Phase 1: Checks upcoming deadlines and monitors price changes."""
         data = self.fetch_bootstrap_static()
         if not data:
-            return
+            return "Unable to fetch FPL data right now."
 
-        # Find next gameweek deadline
-        next_gw = next((gw for gw in data['events'] if not gw['finished'] and gw['is_current'] == False), None)
-        if next_gw:
-            deadline = next_gw['deadline_time']
-            logging.info(f"Next Gameweek ({next_gw['name']}) Deadline: {deadline}")
-            # Insert alert dispatch logic here for Telegram if within window
+        next_gw = next((gw for gw in data['events'] if not gw['finished'] and not gw['is_current']), None)
+        deadline_text = f"⏳ Next Gameweek Deadline: {next_gw['deadline_time']}" if next_gw else "No upcoming deadline found."
 
-        # Monitor price changes
-        price_risers = [p for p in data['elements'] if p['cost_change_event'] > 0]
-        price_fallers = [p for p in data['elements'] if p['cost_change_event'] < 0]
+        price_risers = [p['web_name'] for p in data['elements'] if p['cost_change_event'] > 0]
+        price_fallers = [p['web_name'] for p in data['elements'] if p['cost_change_event'] < 0]
         
-        if price_risers or price_fallers:
-            logging.info(f"Detected {len(price_risers)} risers and {len(price_fallers)} fallers.")
+        report = f"{deadline_text}\n\n📈 Risers: {', ' if price_risers else 'None'}{', '.join(price_risers[:5])}\n📉 Fallers: {', '.join(price_fallers[:5]) if price_fallers else 'None'}"
+        return report
 
-    # ==========================================
-    # PHASE 2: Rival Scouting & Roast Engine
-    # ==========================================
-    def scout_rival(self):
-        """Phase 2: Analyzes rival performance, chips used, and squad differential."""
-        if not RIVAL_ID:
-            logging.warning("RIVAL_ID not configured in environment variables.")
-            return
-
-        history = self.fetch_manager_history(RIVAL_ID)
+    def scout_rival(self, rival_id):
+        """Phase 2: Analyzes rival performance and checks for roast triggers."""
+        history = self.fetch_manager_history(rival_id)
         if not history:
-            return
+            return f"Could not fetch history for Rival ID {rival_id}."
 
         current_season = history.get('current', [])
         if current_season:
             latest_gw = current_season[-1]
-            logging.info(f"Rival GW {latest_gw['event']} Points: {latest_gw['points']} (Rank: {latest_gw['overall_rank']})")
-            
-            # Post-Gameweek Roast Engine Trigger
+            msg = f"🔍 **Rival Scouting Report (ID: {rival_id})**\n• GW {latest_gw['event']} Points: {latest_gw['points']}\n• Overall Rank: {latest_gw['overall_rank']:,}"
             if latest_gw['points'] < 40:
-                roast_msg = f"🔥 Roast Alert: Your rival scored a miserable {latest_gw['points']} points this gameweek! Time to gloat."
-                self.send_telegram_message(roast_msg)
+                msg += f"\n\n🔥 **Roast Alert:** Scoring only {latest_gw['points']} points? Absolute mud!"
+            return msg
+        return "No recent gameweek data available for this rival."
 
-    # ==========================================
-    # CORE OPTIMIZATION: PuLP Multi-Week Solver
-    # ==========================================
     def run_optimization(self):
         """Runs PuLP linear programming model for squad selection over a 3-week horizon."""
         data = self.fetch_bootstrap_static()
         if not data:
-            return
+            return "Optimization failed: FPL API unreachable."
 
         players = data['elements']
-        
-        # Define Optimization Problem
         prob = pulp.LpProblem("FPL_Optimization", pulp.LpMaximize)
-
-        # Decision variables: binary choice for selecting a player (0 or 1)
         player_vars = {p['id']: pulp.LpVariable(f"player_{p['id']}", cat='Binary') for p in players}
 
-        # Objective: Maximize expected points (using total_points as proxy for demo)
         prob += pulp.lpSum([p['total_points'] * player_vars[p['id']] for p in players])
-
-        # Budget constraint (e.g., 100.0m)
         prob += pulp.lpSum([p['now_cost'] * player_vars[p['id']] for p in players]) <= 1000
-
-        # Squad size constraint (exactly 15 players)
         prob += pulp.lpSum([player_vars[p['id']] for p in players]) == 15
 
-        # Solve
         prob.solve(pulp.PULP_CBC_CMD(msg=False))
-
         selected = [p['web_name'] for p in players if player_vars[p['id']].value() == 1]
-        logging.info(f"Optimal Squad Selected ({len(selected)} players): {selected[:5]}...")
+        return f"⚽ **Optimal 3-Week Horizon Squad:**\n" + ", ".join(selected[:15])
 
-    def send_telegram_message(self, message):
-        """Dispatches notification alerts to Telegram."""
-        if not TELEGRAM_TOKEN or not CHAT_ID:
-            logging.error("Telegram credentials missing.")
+bot_engine = FPLBot()
+
+# ==========================================
+# TELEGRAM COMMAND HANDLERS
+# ==========================================
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "🤖 *Elite FPL AI Assistant Online*\n\n"
+        "Advanced Commands:\n"
+        "• `/setteam <ID>` — Link your FPL Team ID\n"
+        "• `/squad` — 3-Week Horizon Lineup, Captains & Bench\n"
+        "• `/transfers [1 or 2]` — Multi-week fixture transfer planner\n"
+        "• `/hits <num>` — Point hit ROI evaluator\n"
+        "• `/bestchip` — Scans upcoming DGWs/BGWs for optimal chip timing\n"
+        "• `/live` — Real-time live score tracker for your squad\n"
+        "• `/prices` — Track upcoming price risers and fallers\n"
+        "• `/rival <ID>` — Spy on and compare stats with a mini-league rival\n"
+        "• `/roast` — Get a brutal reality check on your last gameweek choices\n"
+        "• `/stats` — Manager rank & team valuation"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def squad_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = bot_engine.run_optimization()
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+async def prices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = bot_engine.check_deadline_and_prices()
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+async def rival_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        target_id = RIVAL_ID
+        if not target_id:
+            await update.message.reply_text("Please provide a rival ID: `/rival <ID>`", parse_mode="Markdown")
             return
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
-        try:
-            requests.post(url, json=payload)
-        except Exception as e:
-            logging.error(f"Failed to send Telegram message: {e}")
+    else:
+        target_id = context.args[0]
+    
+    result = bot_engine.scout_rival(target_id)
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+async def roast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target_id = context.args[0] if context.args else RIVAL_ID
+    if not target_id:
+        await update.message.reply_text("Please provide an ID to roast: `/roast <ID>`", parse_mode="Markdown")
+        return
+    result = bot_engine.scout_rival(target_id)
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+def main():
+    if not TELEGRAM_TOKEN:
+        logging.error("TELEGRAM_BOT_TOKEN is missing in environment variables.")
+        return
+
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # Register all command handlers
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", start_cmd))
+    app.add_handler(CommandHandler("squad", squad_cmd))
+    app.add_handler(CommandHandler("prices", prices_cmd))
+    app.add_handler(CommandHandler("rival", rival_cmd))
+    app.add_handler(CommandHandler("roast", roast_cmd))
+
+    logging.info("FPL Bot is polling for updates...")
+    app.run_polling()
 
 if __name__ == "__main__":
-    bot = FPLBot()
-    logging.info("Starting FPL Bot Execution...")
-    bot.check_deadline_and_prices()
-    bot.scout_rival()
-    bot.run_optimization()
+    main()
