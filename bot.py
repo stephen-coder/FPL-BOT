@@ -1,9 +1,10 @@
 import os
-import pulp
-import requests
+import json
 import threading
 import asyncio
-from flask import Flask
+import pulp
+import requests
+from flask import Flask, request
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -11,15 +12,63 @@ from telegram.ext import (
     ContextTypes,
 )
 
+# --- SIMPLE PERSISTENCE FOR LINKED TEAM IDS ---
+# Render's filesystem is ephemeral across deploys, but this survives
+# ordinary restarts/reboots within the same container instance, which
+# in-memory user_data does not.
+
+DATA_FILE = os.getenv("FPL_BOT_DATA_FILE", "user_teams.json")
+_data_lock = threading.Lock()
+
+
+def _load_team_map():
+    if not os.path.exists(DATA_FILE):
+        return {}
+    try:
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_team_map(mapping):
+    with _data_lock:
+        with open(DATA_FILE, "w") as f:
+            json.dump(mapping, f)
+
+
+def get_team_id(chat_id):
+    return _load_team_map().get(str(chat_id))
+
+
+def set_team_id(chat_id, team_id):
+    mapping = _load_team_map()
+    mapping[str(chat_id)] = team_id
+    _save_team_map(mapping)
+
+
 # --- FPL DATA FETCHERS ---
 
 FPL_BASE_URL = "https://fantasy.premierleague.com/api/"
+
+# The FPL API blocks requests that don't look like they came from a
+# browser (returns 403). A realistic User-Agent (plus a couple of the
+# headers a real browser sends) fixes the /squad 403s.
+FPL_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://fantasy.premierleague.com/",
+}
 
 
 def get_fpl_bootstrap():
     """Fetches core database metrics from the official FPL API."""
     url = f"{FPL_BASE_URL}bootstrap-static/"
-    res = requests.get(url)
+    res = requests.get(url, headers=FPL_HEADERS, timeout=15)
     res.raise_for_status()
     return res.json()
 
@@ -39,7 +88,15 @@ def fetch_user_squad(team_id):
     prev_gw = max(1, next_gw - 1)
 
     url = f"{FPL_BASE_URL}entry/{team_id}/event/{prev_gw}/picks/"
-    res = requests.get(url)
+    try:
+        res = requests.get(url, headers=FPL_HEADERS, timeout=15)
+    except requests.RequestException:
+        return None, 0.0, next_gw
+
+    if res.status_code == 403:
+        print(f"FPL API returned 403 for team {team_id} — likely blocked/rate-limited request")
+        return None, 0.0, next_gw
+
     if res.status_code != 200:
         return None, 0.0, next_gw
 
@@ -75,6 +132,9 @@ def fetch_user_squad(team_id):
 
 def solve_starting_xi(squad):
     """Solves for Starting 11, Captain (C), Vice Captain (VC), and Bench order."""
+    if not squad:
+        return [], []
+
     prob = pulp.LpProblem("Lineup_Opt", pulp.LpMaximize)
 
     start_vars = {
@@ -112,7 +172,9 @@ def solve_starting_xi(squad):
     prob += pulp.lpSum([start_vars[p["id"]] for p in fwds]) >= 1
     prob += pulp.lpSum([start_vars[p["id"]] for p in fwds]) <= 3
 
-    prob.solve(pulp.PULP_CBC_CMD(msg=0))
+    status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
+    if pulp.LpStatus[status] != "Optimal":
+        return [], []
 
     starters, bench = [], []
     for p in squad:
@@ -142,13 +204,26 @@ def solve_starting_xi(squad):
 
 
 def solve_transfers(squad, bank, num_transfers=1):
-    """Calculates optimal 1 or 2 player swaps based on budget and xP gain."""
+    """
+    Jointly optimizes which `num_transfers` players to sell and which to buy,
+    under one shared budget, maximizing total expected-points gain.
+
+    Replaces the old greedy one-swap-at-a-time approach, which could miss
+    better combinations (e.g. selling two mid-value players to afford one
+    premium) and evaluated each swap against a shrinking bank sequentially
+    rather than jointly.
+    """
+    if not squad:
+        return [], bank, 0.0
+
     data = get_fpl_bootstrap()
     types = {t["id"]: t["singular_name_short"] for t in data["element_types"]}
 
     current_ids = {p["id"] for p in squad}
     candidates = []
     for p in data["elements"]:
+        if p["id"] in current_ids:
+            continue
         if p["status"] == "a" and float(p["ep_next"] or 0) > 0:
             candidates.append(
                 {
@@ -162,44 +237,73 @@ def solve_transfers(squad, bank, num_transfers=1):
                 }
             )
 
+    prob = pulp.LpProblem("Transfer_Opt", pulp.LpMaximize)
+
+    out_vars = {p["id"]: pulp.LpVariable(f"out_{p['id']}", cat="Binary") for p in squad}
+    in_vars = {c["id"]: pulp.LpVariable(f"in_{c['id']}", cat="Binary") for c in candidates}
+
+    # Maximize net expected-points gain (points added minus points lost)
+    prob += pulp.lpSum([c["ep_next"] * in_vars[c["id"]] for c in candidates]) - pulp.lpSum(
+        [p["ep_next"] * out_vars[p["id"]] for p in squad]
+    )
+
+    # Exactly num_transfers players leave, exactly num_transfers arrive
+    prob += pulp.lpSum(out_vars.values()) == num_transfers
+    prob += pulp.lpSum(in_vars.values()) == num_transfers
+
+    # Squad shape must stay valid: swaps balance position-for-position
+    for pos_id in {p["pos_id"] for p in squad}:
+        prob += pulp.lpSum(
+            [out_vars[p["id"]] for p in squad if p["pos_id"] == pos_id]
+        ) == pulp.lpSum(
+            [in_vars[c["id"]] for c in candidates if c["pos_id"] == pos_id]
+        )
+
+    # Budget: bank + money freed from sales must cover new purchases
+    prob += bank + pulp.lpSum(
+        [p["cost"] * out_vars[p["id"]] for p in squad]
+    ) >= pulp.lpSum([c["cost"] * in_vars[c["id"]] for c in candidates])
+
+    # Club limit (max 3 players per PL team) on the resulting squad
+    remaining_by_team = {}
+    for p in squad:
+        remaining_by_team.setdefault(p["team"], []).append(p)
+    all_teams = {p["team"] for p in squad} | {c["team"] for c in candidates}
+    for team_id in all_teams:
+        kept = [p for p in squad if p["team"] == team_id]
+        prob += (
+            pulp.lpSum([1 - out_vars[p["id"]] for p in kept])
+            + pulp.lpSum([in_vars[c["id"]] for c in candidates if c["team"] == team_id])
+            <= 3
+        )
+
+    status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
+    if pulp.LpStatus[status] != "Optimal":
+        return [], bank, 0.0
+
+    players_out = [p for p in squad if pulp.value(out_vars[p["id"]]) == 1]
+    players_in = [c for c in candidates if pulp.value(in_vars[c["id"]]) == 1]
+
+    total_gain = sum(c["ep_next"] for c in players_in) - sum(p["ep_next"] for p in players_out)
+    if total_gain <= 0.5:
+        return [], bank, 0.0
+
+    remaining_bank = (
+        bank + sum(p["cost"] for p in players_out) - sum(c["cost"] for c in players_in)
+    )
+
+    # Pair sells with buys of the same position for readable messaging
     swaps = []
-    current_squad_ids = set(current_ids)
-    bank_balance = bank
-    total_gain = 0.0
+    ins_by_pos = {}
+    for c in players_in:
+        ins_by_pos.setdefault(c["pos_id"], []).append(c)
+    for p in players_out:
+        pool = ins_by_pos.get(p["pos_id"], [])
+        partner = pool.pop() if pool else None
+        gain = (partner["ep_next"] - p["ep_next"]) if partner else 0.0
+        swaps.append((p, partner, gain))
 
-    sorted_squad = sorted(squad, key=lambda x: x["ep_next"])
-
-    for out_p in sorted_squad:
-        if len(swaps) >= num_transfers:
-            break
-
-        pos_id = out_p["pos_id"]
-        out_cost = out_p["cost"]
-        out_ep = out_p["ep_next"]
-        max_budget = out_cost + bank_balance
-
-        eligible_targets = [
-            p
-            for p in candidates
-            if p["pos_id"] == pos_id
-            and p["id"] not in current_squad_ids
-            and p["cost"] <= max_budget
-        ]
-
-        if not eligible_targets:
-            continue
-
-        best_target = max(eligible_targets, key=lambda p: p["ep_next"])
-        gain = best_target["ep_next"] - out_ep
-
-        if gain > 0.5:
-            bank_balance += out_cost - best_target["cost"]
-            total_gain += gain
-            swaps.append((out_p, best_target, gain))
-            current_squad_ids.remove(out_p["id"])
-            current_squad_ids.add(best_target["id"])
-
-    return swaps, bank_balance, total_gain
+    return swaps, remaining_bank, total_gain
 
 
 def solve_chip_squad(horizon_gws=1):
@@ -257,7 +361,9 @@ def solve_chip_squad(horizon_gws=1):
             <= 3
         )
 
-    prob.solve(pulp.PULP_CBC_CMD(msg=0))
+    status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
+    if pulp.LpStatus[status] != "Optimal":
+        return []
     return [p for p in players if pulp.value(vars[p["id"]]) == 1]
 
 
@@ -285,14 +391,20 @@ async def setteam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     team_id = context.args[0]
-    context.user_data["team_id"] = team_id
+    if not team_id.isdigit():
+        await update.message.reply_text(
+            "❌ That doesn't look like a valid FPL Team ID (should be numeric)."
+        )
+        return
+
+    set_team_id(update.effective_chat.id, team_id)
     await update.message.reply_text(
         f"✅ FPL Team ID linked: *{team_id}*", parse_mode="Markdown"
     )
 
 
 async def squad_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    team_id = context.user_data.get("team_id")
+    team_id = get_team_id(update.effective_chat.id)
     if not team_id:
         await update.message.reply_text(
             "⚠️ Link your team first using `/setteam <ID>`."
@@ -306,11 +418,20 @@ async def squad_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not squad:
         await update.message.reply_text(
-            "❌ Unable to fetch squad. Check your FPL Team ID."
+            "❌ Unable to fetch squad. This usually means either the Team ID "
+            "is wrong, or your FPL account's privacy setting is blocking "
+            "public access to your team — check Settings → Privacy on the "
+            "FPL site and make sure your team isn't set to private."
         )
         return
 
     starters, bench = solve_starting_xi(squad)
+    if not starters:
+        await update.message.reply_text(
+            "❌ Couldn't compute a valid lineup from your squad data. Try again shortly."
+        )
+        return
+
     total_xp = sum(p["ep_next"] for p in starters) + sum(
         p["ep_next"] for p in starters if p.get("is_captain")
     )
@@ -334,7 +455,7 @@ async def squad_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def transfers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    team_id = context.user_data.get("team_id")
+    team_id = get_team_id(update.effective_chat.id)
     if not team_id:
         await update.message.reply_text(
             "⚠️ Link your team first using `/setteam <ID>`."
@@ -355,7 +476,10 @@ async def transfers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     squad, bank, next_gw = fetch_user_squad(team_id)
     if not squad:
         await update.message.reply_text(
-            "❌ Unable to fetch squad. Check your FPL Team ID."
+            "❌ Unable to fetch squad. This usually means either the Team ID "
+            "is wrong, or your FPL account's privacy setting is blocking "
+            "public access to your team — check Settings → Privacy on the "
+            "FPL site and make sure your team isn't set to private."
         )
         return
 
@@ -372,7 +496,8 @@ async def transfers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"🔄 *RECOMMENDED TRANSFER PLAN (GW{next_gw})*\n\n"
     for out_p, in_p, gain in swaps:
         msg += f"🔴 *OUT:* [{out_p['pos']}] {out_p['name']} (£{out_p['cost']}m)\n"
-        msg += f"🟢 *IN:* [{in_p['pos']}] {in_p['name']} (£{in_p['cost']}m)\n"
+        if in_p:
+            msg += f"🟢 *IN:* [{in_p['pos']}] {in_p['name']} (£{in_p['cost']}m)\n"
         msg += f"📈 *Projected Gain:* +{gain:.2f} xP\n\n"
 
     msg += f"💰 *Remaining Bank:* £{remaining_bank:.1f}m\n"
@@ -386,6 +511,9 @@ async def freehit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🃏 Calculating optimal Free Hit squad for maximum single GW points..."
     )
     squad = solve_chip_squad(horizon_gws=1)
+    if not squad:
+        await update.message.reply_text("❌ Couldn't compute a Free Hit squad right now.")
+        return
 
     msg = "🔥 *OPTIMAL FREE HIT SQUAD*\n\n"
     total_cost = sum(p["cost"] for p in squad)
@@ -406,6 +534,9 @@ async def wildcard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔮 Calculating optimal Wildcard squad over a 5-10 GW horizon..."
     )
     squad = solve_chip_squad(horizon_gws=5)
+    if not squad:
+        await update.message.reply_text("❌ Couldn't compute a Wildcard squad right now.")
+        return
 
     msg = "🃏 *OPTIMAL WILDCARD SQUAD (Multi-GW Horizon)*\n\n"
     total_cost = sum(p["cost"] for p in squad)
@@ -425,12 +556,10 @@ async def wildcard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 flask_app = Flask(__name__)
 
-# Initialize the Telegram Application globally
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set!")
 
-# Build the app without running polling
 telegram_app = ApplicationBuilder().token(TOKEN).build()
 
 telegram_app.add_handler(CommandHandler("start", start_cmd))
@@ -439,6 +568,26 @@ telegram_app.add_handler(CommandHandler("squad", squad_cmd))
 telegram_app.add_handler(CommandHandler("transfers", transfers_cmd))
 telegram_app.add_handler(CommandHandler("freehit", freehit_cmd))
 telegram_app.add_handler(CommandHandler("wildcard", wildcard_cmd))
+
+# One persistent event loop for the whole process, run on a background
+# thread. This fixes the original design, which called asyncio.run()
+# (a NEW event loop) on every single webhook hit and re-initialized
+# telegram_app.initialize() every time — wasteful, and under concurrent
+# requests could race or lose updates.
+_bot_loop = asyncio.new_event_loop()
+
+
+def _start_loop():
+    asyncio.set_event_loop(_bot_loop)
+    _bot_loop.run_forever()
+
+
+_loop_thread = threading.Thread(target=_start_loop, daemon=True)
+_loop_thread.start()
+
+# Initialize the PTB application once, on the persistent loop, before
+# any requests are served.
+asyncio.run_coroutine_threadsafe(telegram_app.initialize(), _bot_loop).result()
 
 
 @flask_app.route("/")
@@ -449,31 +598,34 @@ def health_check():
 @flask_app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
     """Endpoint that receives updates directly from Telegram."""
-    from flask import request
-    import asyncio
+    update = Update.de_json(request.get_json(force=True), telegram_app.bot)
 
-    if request.method == "POST":
-        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-        
-        # Run the update processing in the async event loop
-        async def process():
-            await telegram_app.initialize()
-            await telegram_app.process_update(update)
-
-        asyncio.run(process())
-        return "OK", 200
-    return "Forbidden", 403
+    # Hand the update to the persistent event loop instead of spinning
+    # up a new one per request.
+    asyncio.run_coroutine_threadsafe(
+        telegram_app.process_update(update), _bot_loop
+    )
+    return "OK", 200
 
 
-# Automatically set the webhook URL with Telegram when Gunicorn boots up
-with flask_app.app_context():
-    import requests as req
-    RENDER_URL = os.getenv("RENDER_EXTERNAL_URL") # Render automatically provides this!
-    if RENDER_URL:
-        webhook_url = f"{RENDER_URL}/{TOKEN}"
-        req.get(f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={webhook_url}")
-        print(f"Webhook automatically set to: {webhook_url}")
+def _set_webhook_once():
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
+    if not render_url:
+        return
+    webhook_url = f"{render_url}/{TOKEN}"
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/setWebhook",
+            data={"url": webhook_url},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        print(f"Webhook set to: {webhook_url}")
+    except requests.RequestException as e:
+        print(f"Failed to set webhook: {e}")
 
-# Keep this for local testing if needed
+
+_set_webhook_once()
+
 if __name__ == "__main__":
     flask_app.run(host="0.0.0.0", port=10000)
