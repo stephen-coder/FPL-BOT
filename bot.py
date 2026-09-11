@@ -92,20 +92,17 @@ def calculate_horizon_xp(player, team_id_to_fixtures, current_gw, horizon=3):
     if base_ep <= 0:
         return 0.0
 
-    # Get fixtures for this player's team over the next N gameweeks
     team_fixtures = team_id_to_fixtures.get(player["team"], [])
     upcoming = [f for f in team_fixtures if f.get("event") and current_gw <= f["event"] < current_gw + horizon]
 
     if not upcoming:
-        return base_ep * horizon  # Fallback if fixture schedule is unavailable
+        return base_ep * horizon
 
     total_weighted_xp = 0.0
-    decay_factors = [1.0, 0.85, 0.7]  # Weight near-term GWs higher than distant ones
+    decay_factors = [1.0, 0.85, 0.7]
 
     for idx, fix in enumerate(upcoming[:horizon]):
         decay = decay_factors[idx] if idx < len(decay_factors) else 0.5
-        # FPL difficulty scale is 1 to 5. Lower is easier.
-        # Convert difficulty to multiplier: diff 2 -> 1.1x, diff 3 -> 1.0x, diff 4 -> 0.85x, diff 5 -> 0.7x
         is_home = fix.get("team_h") == player["team"]
         diff = fix.get("team_h_difficulty" if is_home else "team_a_difficulty", 3)
         
@@ -141,7 +138,6 @@ def fetch_user_squad(team_id):
     types = {t["id"]: t["singular_name_short"] for t in data["element_types"]}
     players_by_id = {p["id"]: p for p in data["elements"]}
 
-    # Build fixture map for horizon xP calculation
     fixtures = get_fixtures()
     team_fixtures = {}
     for f in fixtures:
@@ -181,8 +177,6 @@ def solve_starting_xi(squad, chip=None, use_horizon=False):
         return [], [], None, None
 
     prob = pulp.LpProblem("Lineup_Opt", pulp.LpMaximize)
-
-    # Use horizon_xp if multi-week analysis is requested, else single-gw ep_next
     scoring_key = "horizon_xp" if use_horizon else "ep_next"
 
     start_vars = {p["id"]: pulp.LpVariable(f"start_{p['id']}", cat="Binary") for p in squad}
@@ -231,7 +225,6 @@ def solve_starting_xi(squad, chip=None, use_horizon=False):
         else:
             bench.append(p)
 
-    # Determine Safe Captain (Highest xP) & Differential Captain (<10% ownership, high xP)
     sorted_starters = sorted(starters, key=lambda x: x[scoring_key], reverse=True)
     safe_captain = sorted_starters[0] if sorted_starters else None
 
@@ -290,7 +283,6 @@ def solve_transfers(squad, bank, num_transfers=1):
     out_vars = {p["id"]: pulp.LpVariable(f"out_{p['id']}", cat="Binary") for p in squad}
     in_vars = {c["id"]: pulp.LpVariable(f"in_{c['id']}", cat="Binary") for c in candidates}
 
-    # Maximize horizon xP gain to account for multi-week fixture swings
     prob += pulp.lpSum([c["horizon_xp"] * in_vars[c["id"]] for c in candidates]) - pulp.lpSum(
         [p["horizon_xp"] * out_vars[p["id"]] for p in squad]
     )
@@ -349,7 +341,6 @@ def analyze_chip_timing():
     next_gw = get_next_gw(data)
 
     gw_analysis = []
-    # Analyze next 6 gameweeks
     for gw_id in range(next_gw, min(next_gw + 6, 39)):
         gw_fixtures = [f for f in fixtures if f.get("event") == gw_id]
         team_match_counts = {}
@@ -371,7 +362,6 @@ def analyze_chip_timing():
 
 # --- TELEGRAM COMMAND HANDLERS ---
 
-
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "🤖 *Elite FPL AI Assistant Online*\n\n"
@@ -381,7 +371,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/transfers [1 or 2]` — Multi-week fixture transfer planner\n"
         "• `/hits <num>` — Point hit ROI evaluator\n"
         "• `/bestchip` — Scans upcoming DGWs/BGWs for optimal chip timing\n"
-        "• `/benchboost` / `/triplecaptain` — Chip simulation squads\n"
+        "• `/live` — Real-time live score tracker for your squad\n"
+        "• `/prices` — Track upcoming price risers and fallers\n"
         "• `/stats` — Manager rank & team valuation\n"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -526,121 +517,93 @@ async def bestchip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if gw["doubles"] > 0:
             status_icon = f"🔥 **Double GW ({gw['doubles']} teams)** -> *Ideal for Bench Boost / Triple Captain*"
         elif gw["blanks"] > 3:
-            status_icon = f"⚠️ **Blank GW ({gw['blanks']} teams blank)** -> *Ideal for Free Hit*"
-
+            status_icon = f"⚠️ **Blank GW ({gw['blanks']} teams blanking)** -> *Ideal for Free Hit*"
+        
         msg += f"• **GW{gw['gw']}:** {status_icon}\n"
 
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-async def benchboost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tracks real-time points for your squad in the current active gameweek."""
     team_id = get_team_id(update.effective_chat.id)
     if not team_id:
         await update.message.reply_text("⚠️ Link your team first using `/setteam <ID>`.")
         return
-    squad, _, next_gw, _ = fetch_user_squad(team_id)
-    starters, bench, _, _ = solve_starting_xi(squad, chip='benchboost', use_horizon=True)
-    total_xp = sum(p["horizon_xp"] for p in starters) + sum(p["horizon_xp"] for p in bench)
 
-    msg = f"🚀 *GW{next_gw} BENCH BOOST (3-Week Horizon)*\n📊 *Total 15-Man Horizon xP:* {total_xp:.1f}\n\n"
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    data = get_fpl_bootstrap()
+    current_gw = None
+    for gw in data["events"]:
+        if gw["is_current"]:
+            current_gw = gw["id"]
+            break
 
-
-async def triplecaptain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    team_id = get_team_id(update.effective_chat.id)
-    if not team_id:
-        await update.message.reply_text("⚠️ Link your team first using `/setteam <ID>`.")
-        return
-    squad, _, next_gw, _ = fetch_user_squad(team_id)
-    starters, _, safe_c, _ = solve_starting_xi(squad, chip='triplecaptain', use_horizon=True)
-    total_xp = sum(p["horizon_xp"] for p in starters) + (safe_c["horizon_xp"] if safe_c else 0)
-
-    msg = f"⭐ *GW{next_gw} TRIPLE CAPTAIN (3-Week Horizon)*\n📊 *Projected Horizon Score:* {total_xp:.1f}\n\n"
-    if safe_c:
-        msg += f"• **Triple Captain Pick:** {safe_c['name']} (x3 multiplier)\n"
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    team_id = get_team_id(update.effective_chat.id)
-    if not team_id:
-        await update.message.reply_text("⚠️ Link your team first using `/setteam <ID>`.")
-        return
-    _, _, _, entry_info = fetch_user_squad(team_id)
-    if not entry_info:
-        await update.message.reply_text("❌ Could not retrieve team stats.")
+    if not current_gw:
+        await update.message.reply_text("⏳ No gameweek is currently live right now. Check back when matches kick off!")
         return
 
-    msg = f"📊 *TEAM PROFILE*\n" \
-          f"• *Name:* {entry_info.get('name')}\n" \
-          f"• *Overall Rank:* {entry_info.get('summary_overall_rank', 'N/A'):,}\n" \
-          f"• *Total Points:* {entry_info.get('summary_overall_points')}\n"
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-
-# --- FLASK & TELEGRAM WEBHOOK INTEGRATION ---
-
-flask_app = Flask(__name__)
-
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set!")
-
-telegram_app = ApplicationBuilder().token(TOKEN).build()
-
-telegram_app.add_handler(CommandHandler("start", start_cmd))
-telegram_app.add_handler(CommandHandler("setteam", setteam_cmd))
-telegram_app.add_handler(CommandHandler("squad", squad_cmd))
-telegram_app.add_handler(CommandHandler("transfers", transfers_cmd))
-telegram_app.add_handler(CommandHandler("hits", hits_cmd))
-telegram_app.add_handler(CommandHandler("bestchip", bestchip_cmd))
-telegram_app.add_handler(CommandHandler("benchboost", benchboost_cmd))
-telegram_app.add_handler(CommandHandler("triplecaptain", triplecaptain_cmd))
-telegram_app.add_handler(CommandHandler("stats", stats_cmd))
-
-_bot_loop = asyncio.new_event_loop()
-
-
-def _start_loop():
-    asyncio.set_event_loop(_bot_loop)
-    _bot_loop.run_forever()
-
-
-_loop_thread = threading.Thread(target=_start_loop, daemon=True)
-_loop_thread.start()
-
-asyncio.run_coroutine_threadsafe(telegram_app.initialize(), _bot_loop).result()
-
-
-@flask_app.route("/")
-def health_check():
-    return "Elite FPL Telegram Bot is running live via Webhooks!", 200
-
-
-@flask_app.route(f"/{TOKEN}", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-    asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), _bot_loop)
-    return "OK", 200
-
-
-def _set_webhook_once():
-    render_url = os.getenv("RENDER_EXTERNAL_URL")
-    if not render_url:
-        return
-    webhook_url = f"{render_url}/{TOKEN}"
+    url = f"{FPL_BASE_URL}entry/{team_id}/event/{current_gw}/picks/"
     try:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/setWebhook",
-            data={"url": webhook_url},
-            timeout=10,
-        )
-        resp.raise_for_status()
+        res = requests.get(url, headers=FPL_HEADERS, timeout=15)
+        if res.status_code != 200:
+            await update.message.reply_text("❌ Could not fetch live squad data.")
+            return
+        picks_data = res.json()
     except requests.RequestException:
-        pass
+        await update.message.reply_text("❌ Network error fetching live scores.")
+        return
+
+    players_by_id = {p["id"]: p for p in data["elements"]}
+    picks = picks_data.get("picks", [])
+    entry_history = picks_data.get("entry_history", {})
+    
+    total_points = entry_history.get("points", 0)
+    event_transfers_cost = entry_history.get("event_transfers_cost", 0)
+
+    msg = f"🔴 *GW{current_gw} LIVE TRACKER*\n"
+    msg += f"📊 *Live Points (Net):* {total_points - event_transfers_cost} pts (Hits: -{event_transfers_cost})\n\n"
+    msg += "⚽ *Starting XI Live Scores*\n"
+
+    for p in picks[:11]:
+        pid = p["element"]
+        mult = p["multiplier"]
+        player_info = players_by_id.get(pid, {})
+        name = player_info.get("web_name", "Unknown")
+        match_pts = player_info.get("event_points", 0)
+        
+        role = ""
+        if mult == 2:
+            role = " *(C)*"
+        elif mult == 3:
+            role = " *(TC)*"
+        elif mult == 0:
+            role = " *(Bench)*"
+
+        msg += f"• {name}{role}: **{match_pts * max(1, mult)} pts** ({match_pts} x {max(1, mult)})\n"
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-_set_webhook_once()
+async def prices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tracks players closest to rising or falling in price based on net transfers."""
+    data = get_fpl_bootstrap()
+    elements = data["elements"]
 
-if __name__ == "__main__":
-    flask_app.run(host="0.0.0.0", port=10000)
+    # Sort by cost change likelihood (transfers_in_event - transfers_out_event roughly approximates net change momentum)
+    sorted_risers = sorted(elements, key=lambda x: x.get("transfers_in_event", 0), reverse=True)[:5]
+    sorted_fallers = sorted(elements, key=lambda x: x.get("transfers_out_event", 0), reverse=True)[:5]
+
+    msg = "💰 *FPL PRICE CHANGE WATCHLIST*\n\n"
+    msg += "🔥 **Top Potential Risers (Inbound Momentum)**\n"
+    for p in sorted_risers:
+        cost = p["now_cost"] / 10.0
+        net_in = p.get("transfers_in_event", 0)
+        msg += f"• {p['web_name']} (£{cost}m) — +{net_in:,} transfers\n"
+
+    msg += "\n📉 **Top Potential Fallers (Outbound Momentum)**\n"
+    for p in sorted_fallers:
+        cost = p["now_cost"] / 10.0
+        net_out = p.get("transfers_out_event", 0)
+        msg += f"• {p['web_name']} (£{cost}m) — -{net_out:,} transfers\n"
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
