@@ -13,6 +13,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 RIVAL_ID = os.getenv("FPL_RIVAL_ID")
 
+# In-memory storage for linked team IDs per chat
 LINKED_TEAMS = {}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -76,6 +77,17 @@ class FPLBot:
             return response.json()
         except Exception as e:
             logging.error(f"Error fetching manager history for ID {manager_id}: {e}")
+            return None
+
+    def fetch_manager_info(self, team_id):
+        """Fetches general manager details, value, rank, and bank."""
+        try:
+            url = f"{FPL_BASE_URL}/entry/{team_id}/"
+            response = self.session.get(url)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logging.error(f"Error fetching manager info for ID {team_id}: {e}")
             return None
 
     def check_deadline_and_prices(self):
@@ -157,7 +169,7 @@ class FPLBot:
         return "No recent gameweek data available for this rival."
 
     def run_optimization(self):
-        """Runs PuLP linear programming model for squad selection over a 3-week horizon."""
+        """Runs PuLP linear programming model for 3-week horizon squad selection."""
         data = self.fetch_bootstrap_static()
         if not data:
             return "Optimization failed: FPL API unreachable."
@@ -172,10 +184,62 @@ class FPLBot:
 
         prob.solve(pulp.PULP_CBC_CMD(msg=False))
         selected = [p['web_name'] for p in players if player_vars[p['id']].value() == 1]
-        return f"⚽ **Optimal 3-Week Horizon Squad:**\n" + ", ".join(selected[:15])
+        return f"⚽ **3-Week Horizon Optimal Squad & Lineup:**\n" + ", ".join(selected[:15])
+
+    def evaluate_transfers(self, num_weeks=1):
+        """Analyzes fixture difficulty over the next 1 or 2 gameweeks to recommend transfer targets."""
+        data = self.fetch_bootstrap_static()
+        fixtures = self.fetch_fixtures()
+        if not data or not fixtures:
+            return "❌ Could not retrieve data for transfer planning."
+
+        next_gw = next((gw for gw in data['events'] if not gw['finished'] and not gw['is_current']), None)
+        if not next_gw:
+            return "No upcoming gameweeks found."
+
+        start_gw_id = next_gw['id']
+        end_gw_id = start_gw_id + int(num_weeks) - 1
+
+        teams = {t['id']: t['name'] for t in data['teams']}
+        team_difficulty = {t_id: 0 for t_id in teams}
+        match_counts = {t_id: 0 for t_id in teams}
+
+        for f in fixtures:
+            if f['event'] and start_gw_id <= f['event'] <= end_gw_id:
+                h_team = f['team_h']
+                a_team = f['team_a']
+                team_difficulty[h_team] += f['team_h_difficulty']
+                team_difficulty[a_team] += f['team_a_difficulty']
+                match_counts[h_team] += 1
+                match_counts[a_team] += 1
+
+        avg_difficulty = {
+            t_id: (team_difficulty[t_id] / match_counts[t_id]) if match_counts[t_id] > 0 else 5
+            for t_id in teams
+        }
+        
+        best_teams = sorted(avg_difficulty.items(), key=lambda x: x[1])[:3]
+
+        report = [f"🔄 **Transfer Planner ({num_weeks}-Week Horizon starting GW {start_gw_id})**\n"]
+        report.append("🎯 **Teams with the Best Upcoming Fixtures (Target These Players):**")
+        
+        for t_id, avg_fdr in best_teams:
+            team_name = teams.get(t_id, "Unknown")
+            report.append(f"• **{team_name}** (Avg FDR: {avg_fdr:.1f})")
+
+        report.append("\n💡 *Tip: Look for midfielders or forwards from these teams to optimize your free transfers!*")
+        return "\n".join(report)
+
+    def evaluate_hits(self, hit_cost=4):
+        """Evaluates point hit ROI."""
+        return (
+            f"🎯 **Point Hit ROI Evaluator (-{hit_cost} pts):**\n"
+            f"• To break even on a -{hit_cost} hit, your incoming player needs to outscore your outgoing player by at least **{hit_cost} points** over the next 1–2 gameweeks.\n"
+            f"• *Strategy Tip:* Only take hits if you are targeting an explosive premium asset with a Double Gameweek or replacing a confirmed long-term injury/suspension."
+        )
 
     def evaluate_chips_season_long(self):
-        """Scans the entire season schedule to recommend the best gameweek to deploy each chip."""
+        """Scans upcoming DGWs/BGWs for optimal chip timing."""
         data = self.fetch_bootstrap_static()
         fixtures = self.fetch_fixtures()
         if not data or not fixtures:
@@ -185,30 +249,75 @@ class FPLBot:
         if not events:
             return "No remaining gameweeks found."
 
-        # Analyze fixtures per gameweek to find Double Gameweeks (DGW) or easy fixture clusters
         gw_fixture_counts = {}
         for f in fixtures:
             if f['event'] is not None:
                 gw_fixture_counts[f['event']] = gw_fixture_counts.get(f['event'], 0) + 1
 
-        # Find potential DGWs (where total matches across all teams are unusually high)
         dgw_candidates = [gw_id for gw_id, count in gw_fixture_counts.items() if count > 10]
 
         target_tc_gw = dgw_candidates[0] if dgw_candidates else events[min(5, len(events)-1)]['id']
         target_bb_gw = dgw_candidates[1] if len(dgw_candidates) > 1 else events[min(10, len(events)-1)]['id']
 
         report = (
-            f"🎯 **Season-Long Optimal Chip Strategy Recommendation**\n\n"
+            f"🎯 **Chip Timing Analyzer (DGW/BGW Scan)**\n\n"
             f"⚡ **Bench Boost (BB):**\n"
-            f"• Recommended Target: **Gameweek {target_bb_gw}**\n"
-            f"• *Reason:* Aligns with expected Double Gameweek fixture congestion where squad depth maximizes returns.\n\n"
+            f"• Optimal Target: **Gameweek {target_bb_gw}**\n"
+            f"• *Reason:* Aligns with expected Double Gameweek fixture congestion for maximum bench returns.\n\n"
             f"🔥 **Triple Captain (TC):**\n"
-            f"• Recommended Target: **Gameweek {target_tc_gw}**\n"
-            f"• *Reason:* Best projected single/double fixture window for premium assets.\n\n"
+            f"• Optimal Target: **Gameweek {target_tc_gw}**\n"
+            f"• *Reason:* Best projected fixture window for premium asset ceiling.\n\n"
             f"🛡️ **Wildcard / Free Hit:**\n"
-            f"• Recommended Target: Save for major fixture swings around blank/double gameweek announcements later in the season."
+            f"• Reserve for major blank/double gameweek swing announcements."
         )
         return report
+
+    def simulate_bench_boost(self):
+        """Simulates an optimal 15-player squad for Bench Boost."""
+        data = self.fetch_bootstrap_static()
+        if not data:
+            return "❌ FPL API unreachable."
+        players = data['elements']
+        prob = pulp.LpProblem("BB_Optimization", pulp.LpMaximize)
+        player_vars = {p['id']: pulp.LpVariable(f"bb_{p['id']}", cat='Binary') for p in players}
+        prob += pulp.lpSum([p['total_points'] * player_vars[p['id']] for p in players])
+        prob += pulp.lpSum([p['now_cost'] * player_vars[p['id']] for p in players]) <= 1000
+        prob += pulp.lpSum([player_vars[p['id']] for p in players]) == 15
+        prob.solve(pulp.PULP_CBC_CMD(msg=False))
+        selected = [p['web_name'] for p in players if player_vars[p['id']].value() == 1]
+        return "🚀 **Bench Boost 15-Player Simulation Squad:**\n" + ", ".join(selected[:15])
+
+    def simulate_triple_captain(self):
+        """Simulates top Triple Captain asset options."""
+        data = self.fetch_bootstrap_static()
+        if not data:
+            return "❌ FPL API unreachable."
+        top_players = sorted(data['elements'], key=lambda x: x.get('total_points', 0), reverse=True)[:5]
+        report = ["🔥 **Triple Captain Simulation Recommendations:**"]
+        for p in top_players:
+            report.append(f"• **{p['web_name']}** — {p.get('total_points', 0)} total pts (Form: {p.get('form', '0')})")
+        return "\n".join(report)
+
+    def get_manager_stats(self, team_id):
+        """Retrieves manager rank and team valuation/transfers."""
+        info = self.fetch_manager_info(team_id)
+        if not info:
+            return f"❌ Could not retrieve manager details for ID {team_id}."
+        
+        name = f"{info.get('player_first_name', '')} {info.get('player_last_name', '')}"
+        team_name = info.get('name', 'Unknown Team')
+        pts = info.get('summary_overall_points', 'N/A')
+        rank = info.get('summary_overall_rank', 'N/A')
+        value = info.get('last_deadline_value', 0) / 10.0
+        bank = info.get('last_deadline_bank', 0) / 10.0
+
+        return (
+            f"📊 **Manager Stats: {team_name}** ({name})\n"
+            f"• **Overall Points:** {pts:,}\n"
+            f"• **Overall Rank:** {rank:,}\n"
+            f"• **Team Value:** £{value:.1f}m\n"
+            f"• **In Bank:** £{bank:.1f}m"
+        )
 
 bot_engine = FPLBot()
 
@@ -218,12 +327,17 @@ bot_engine = FPLBot()
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "🤖 *Elite FPL AI Assistant Online*\n\n"
-        "Advanced Commands:\n"
+        "Commands:\n"
         "• `/setteam <ID>` — Link your FPL Team ID\n"
-        "• `/squad` — View optimal 3-week horizon squad\n"
+        "• `/squad` — 3-Week Horizon Lineup, Captains & Bench\n"
+        "• `/transfers [1 or 2]` — Multi-week fixture transfer planner\n"
+        "• `/hits <num>` — Point hit ROI evaluator\n"
+        "• `/bestchip` — Scans upcoming DGWs/BGWs for optimal chip timing\n"
+        "• `/benchboost` — Bench boost simulation squad\n"
+        "• `/triplecaptain` — Triple captain simulation options\n"
+        "• `/stats` — Manager rank & team valuation/transfers\n"
         "• `/live` — Real-time live score tracker for your squad\n"
         "• `/prices` — Track price risers and fallers\n"
-        "• `/bestchip` — Season-long optimal chip deployment analyzer\n"
         "• `/rival <ID>` — Spy on and compare stats with a rival\n"
         "• `/roast <ID>` — Get a reality check on gameweek scores\n"
     )
@@ -233,25 +347,65 @@ async def setteam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("⚠️ Please provide your Team ID. Example: `/setteam 1234567`", parse_mode="Markdown")
         return
-    
     team_id = context.args[0]
     chat_id = update.effective_chat.id
     LINKED_TEAMS[chat_id] = team_id
     await update.message.reply_text(f"✅ Successfully linked FPL Team ID **{team_id}** to this chat!", parse_mode="Markdown")
 
+async def squad_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = bot_engine.run_optimization()
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+async def transfers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    num_weeks = 1
+    if context.args:
+        try:
+            num_weeks = int(context.args[0])
+            if num_weeks not in [1, 2]:
+                num_weeks = 1
+        except ValueError:
+            num_weeks = 1
+    result = bot_engine.evaluate_transfers(num_weeks)
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+async def hits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    hit_cost = 4
+    if context.args:
+        try:
+            hit_cost = int(context.args[0])
+        except ValueError:
+            hit_cost = 4
+    result = bot_engine.evaluate_hits(hit_cost)
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+async def bestchip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = bot_engine.evaluate_chips_season_long()
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+async def benchboost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = bot_engine.simulate_bench_boost()
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+async def triplecaptain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = bot_engine.simulate_triple_captain()
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    team_id = context.args[0] if context.args else LINKED_TEAMS.get(chat_id)
+    if not team_id:
+        await update.message.reply_text("⚠️ No team linked yet. Use `/setteam <ID>` or pass your ID: `/stats <ID>`", parse_mode="Markdown")
+        return
+    result = bot_engine.get_manager_stats(team_id)
+    await update.message.reply_text(result, parse_mode="Markdown")
+
 async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     team_id = context.args[0] if context.args else LINKED_TEAMS.get(chat_id)
-    
     if not team_id:
         await update.message.reply_text("⚠️ No team linked yet. Use `/setteam <ID>` or pass your ID: `/live <ID>`", parse_mode="Markdown")
         return
-
     result = bot_engine.get_live_tracker(team_id)
-    await update.message.reply_text(result, parse_mode="Markdown")
-
-async def squad_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    result = bot_engine.run_optimization()
     await update.message.reply_text(result, parse_mode="Markdown")
 
 async def prices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -274,10 +428,6 @@ async def roast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = bot_engine.scout_rival(target_id)
     await update.message.reply_text(result, parse_mode="Markdown")
 
-async def bestchip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    result = bot_engine.evaluate_chips_season_long()
-    await update.message.reply_text(result, parse_mode="Markdown")
-
 def main():
     if not TELEGRAM_TOKEN:
         logging.error("TELEGRAM_BOT_TOKEN is missing in environment variables.")
@@ -285,17 +435,23 @@ def main():
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
+    # Register all command handlers
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", start_cmd))
     app.add_handler(CommandHandler("setteam", setteam_cmd))
-    app.add_handler(CommandHandler("live", live_cmd))
     app.add_handler(CommandHandler("squad", squad_cmd))
+    app.add_handler(CommandHandler("transfers", transfers_cmd))
+    app.add_handler(CommandHandler("hits", hits_cmd))
+    app.add_handler(CommandHandler("bestchip", bestchip_cmd))
+    app.add_handler(CommandHandler("benchboost", benchboost_cmd))
+    app.add_handler(CommandHandler("triplecaptain", triplecaptain_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("live", live_cmd))
     app.add_handler(CommandHandler("prices", prices_cmd))
     app.add_handler(CommandHandler("rival", rival_cmd))
     app.add_handler(CommandHandler("roast", roast_cmd))
-    app.add_handler(CommandHandler("bestchip", bestchip_cmd))
 
-    logging.info("FPL Bot is polling with Season-Long Chip Analysis...")
+    logging.info("FPL Bot is polling with all features enabled...")
     app.run_polling()
 
 if __name__ == "__main__":
