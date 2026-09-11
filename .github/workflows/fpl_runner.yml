@@ -1,5 +1,6 @@
 import os
 import logging
+import traceback
 import itertools
 from datetime import datetime, timezone
 import requests
@@ -27,16 +28,20 @@ def calculate_selling_price(purchase_price: int, current_price: int) -> int:
 
 def calculate_horizon_score(player_id: int, fixtures_data: dict, decay_rate: float = 0.15) -> float:
     """Computes multi-week expected points score with exponential decay."""
-    total_score = 0.0
-    player_fixtures = fixtures_data.get(player_id, [])
-    for t, gw_data in enumerate(player_fixtures[:3]):
-        xpts = gw_data.get("expected_points", 0.0)
-        weight = 1.0 / ((1.0 + decay_rate) ** t)
-        total_score += xpts * weight
-    return total_score
+    try:
+        total_score = 0.0
+        player_fixtures = fixtures_data.get(player_id, [])
+        for t, gw_data in enumerate(player_fixtures[:3]):
+            xpts = gw_data.get("expected_points", 0.0)
+            weight = 1.0 / ((1.0 + decay_rate) ** t)
+            total_score += xpts * weight
+        return total_score
+    except Exception as e:
+        logger.error(f"Error calculating horizon score for player {player_id}: {e}")
+        return 0.0
 
 def get_next_deadline_info():
-    """Fetches the next upcoming gameweek deadline from the official FPL API."""
+    """Fetches the next upcoming gameweek deadline from the official FPL API with fallback handling."""
     try:
         url = "https://fantasy.premierleague.com/api/bootstrap-static/"
         response = requests.get(url, timeout=10)
@@ -51,8 +56,10 @@ def get_next_deadline_info():
                         "name": event.get("name"),
                         "deadline_time": deadline_dt
                     }
+    except requests.exceptions.RequestException as req_err:
+        logger.warning(f"Network error fetching FPL deadline: {req_err}")
     except Exception as e:
-        logger.error(f"Error fetching FPL deadline: {e}")
+        logger.error(f"Unexpected error fetching FPL deadline: {e}")
     return None
 
 
@@ -60,9 +67,6 @@ def get_next_deadline_info():
 # 2. STRICT MULTI-TRANSFER PACKAGE ENGINE
 # ==========================================
 
-# Cap on how many positional candidates we consider per outgoing slot before
-# taking the product across slots. Keeps itertools.product from exploding
-# when the live player_pool has hundreds of eligible players per position.
 MAX_CANDIDATES_PER_SLOT = 6
 
 def recommend_transfer_package(
@@ -74,138 +78,125 @@ def recommend_transfer_package(
     target_transfers: int = 1
 ) -> dict:
     """
-    Strictly evaluates packages matching the requested target_transfers count.
+    Strictly evaluates packages matching the requested target_transfers count with safety checks.
     """
-    target_transfers = max(1, min(4, target_transfers))
-    
-    # Score squad and sort by weakest horizon scores
-    squad_scored = sorted(
-        [(calculate_horizon_score(p['id'], fixtures_data), p) for p in squad_players],
-        key=lambda x: x[0]
-    )
-    
-    # Build the weakest-candidate pool with positional balance: rather than
-    # taking a flat top-N by score (which can skew toward one position and
-    # starve others out of consideration), pull the weakest players from
-    # EACH position first, then fill any remaining slots by overall score.
-    candidate_pool_size = max(8, target_transfers + 3)
-    positions_present = {p['position'] for p in squad_players}
-    per_position_quota = max(1, candidate_pool_size // max(1, len(positions_present)))
+    try:
+        target_transfers = max(1, min(4, target_transfers))
+        
+        squad_scored = sorted(
+            [(calculate_horizon_score(p['id'], fixtures_data), p) for p in squad_players],
+            key=lambda x: x[0]
+        )
+        
+        candidate_pool_size = max(8, target_transfers + 3)
+        positions_present = {p['position'] for p in squad_players}
+        per_position_quota = max(1, candidate_pool_size // max(1, len(positions_present)))
 
-    weakest_candidates = []
-    seen_ids = set()
-    for pos in positions_present:
-        pos_sorted = [p for score, p in squad_scored if p['position'] == pos]
-        for p in pos_sorted[:per_position_quota]:
+        weakest_candidates = []
+        seen_ids = set()
+        for pos in positions_present:
+            pos_sorted = [p for score, p in squad_scored if p['position'] == pos]
+            for p in pos_sorted[:per_position_quota]:
+                if p['id'] not in seen_ids:
+                    weakest_candidates.append(p)
+                    seen_ids.add(p['id'])
+
+        for score, p in squad_scored:
+            if len(weakest_candidates) >= candidate_pool_size:
+                break
             if p['id'] not in seen_ids:
                 weakest_candidates.append(p)
                 seen_ids.add(p['id'])
-
-    # Top up to candidate_pool_size by overall weakest score if quotas left gaps
-    for score, p in squad_scored:
-        if len(weakest_candidates) >= candidate_pool_size:
-            break
-        if p['id'] not in seen_ids:
-            weakest_candidates.append(p)
-            seen_ids.add(p['id'])
-    
-    best_package = None
-    max_net_gain = float('-inf')
-    
-    extra_transfers = max(0, target_transfers - banked_fts)
-    hit_penalty = extra_transfers * 4  # -4 points per hit
-    
-    # Iterate through exact combinations of N outgoing players
-    for out_group in itertools.combinations(weakest_candidates, target_transfers):
-        sells = [calculate_selling_price(p['purchase_price'], p['current_price']) for p in out_group]
-        combined_cost = sum(sells) + bank
-
-        # Clubs the remaining (non-transferred-out) squad already holds, so we
-        # can enforce FPL's max-3-players-per-club rule on the incoming group.
-        out_ids = {p['id'] for p in out_group}
-        remaining_squad = [p for p in squad_players if p['id'] not in out_ids]
-        club_counts = {}
-        for p in remaining_squad:
-            club = p.get('team')
-            if club is not None:
-                club_counts[club] = club_counts.get(club, 0) + 1
         
-        positional_targets = []
-        valid_combo = True
+        best_package = None
+        max_net_gain = float('-inf')
         
-        for out_p in out_group:
-            valid = [
-                t for t in player_pool 
-                if t['position'] == out_p['position'] 
-                and t['id'] not in [p['id'] for p in squad_players]
-                and t.get('chance_of_playing', 100) >= 75
-            ]
-            if not valid:
-                valid_combo = False
-                break
+        extra_transfers = max(0, target_transfers - banked_fts)
+        hit_penalty = extra_transfers * 4 
+        
+        for out_group in itertools.combinations(weakest_candidates, target_transfers):
+            sells = [calculate_selling_price(p['purchase_price'], p['current_price']) for p in out_group]
+            combined_cost = sum(sells) + bank
 
-            # Cap candidates per slot, but keep it smart: take the top-N by
-            # horizon score AND separately keep the single cheapest affordable
-            # option, so a budget-constrained best package isn't excluded just
-            # because its incoming player didn't crack the top-N by score.
-            valid.sort(key=lambda t: calculate_horizon_score(t['id'], fixtures_data), reverse=True)
-            slot_candidates = valid[:MAX_CANDIDATES_PER_SLOT]
-            cheapest = min(valid, key=lambda t: t['cost'])
-            if cheapest['id'] not in {t['id'] for t in slot_candidates}:
-                slot_candidates.append(cheapest)
-            positional_targets.append(slot_candidates)
-            
-        if not valid_combo:
-            continue
-            
-        # Test product combinations of incoming targets
-        for in_group in itertools.product(*positional_targets):
-            # Ensure all incoming players are unique individuals
-            if len({t['id'] for t in in_group}) < target_transfers:
-                continue
-
-            # Enforce max 3 players per real-life club across remaining squad + incoming
-            in_club_counts = dict(club_counts)
-            club_limit_ok = True
-            for t in in_group:
-                club = t.get('team')
+            out_ids = {p['id'] for p in out_group}
+            remaining_squad = [p for p in squad_players if p['id'] not in out_ids]
+            club_counts = {}
+            for p in remaining_squad:
+                club = p.get('team')
                 if club is not None:
-                    in_club_counts[club] = in_club_counts.get(club, 0) + 1
-                    if in_club_counts[club] > 3:
-                        club_limit_ok = False
-                        break
-            if not club_limit_ok:
+                    club_counts[club] = club_counts.get(club, 0) + 1
+            
+            positional_targets = []
+            valid_combo = True
+            
+            for out_p in out_group:
+                valid = [
+                    t for t in player_pool 
+                    if t['position'] == out_p['position'] 
+                    and t['id'] not in [p['id'] for p in squad_players]
+                    and t.get('chance_of_playing', 100) >= 75
+                ]
+                if not valid:
+                    valid_combo = False
+                    break
+
+                valid.sort(key=lambda t: calculate_horizon_score(t['id'], fixtures_data), reverse=True)
+                slot_candidates = valid[:MAX_CANDIDATES_PER_SLOT]
+                cheapest = min(valid, key=lambda t: t['cost'])
+                if cheapest['id'] not in {t['id'] for t in slot_candidates}:
+                    slot_candidates.append(cheapest)
+                positional_targets.append(slot_candidates)
+                
+            if not valid_combo:
                 continue
                 
-            # Check if total cost fits within budget
-            if sum(t['cost'] for t in in_group) <= combined_cost:
-                out_score = sum(calculate_horizon_score(p['id'], fixtures_data) for p in out_group)
-                in_score = sum(calculate_horizon_score(t['id'], fixtures_data) for t in in_group)
-                
-                gain = in_score - out_score
-                net_gain = gain - hit_penalty
-                
-                if net_gain > max_net_gain:
-                    max_net_gain = net_gain
-                    best_package = {
-                        "package_type": f"{target_transfers}-Transfer Package",
-                        "moves": [
-                            {
-                                "out_name": out_group[i]['name'],
-                                "out_pos": out_group[i]['position'],
-                                "out_xp": round(calculate_horizon_score(out_group[i]['id'], fixtures_data), 1),
-                                "in_name": in_group[i]['name'],
-                                "in_cost": in_group[i]['cost'] / 10.0,
-                                "in_xp": round(calculate_horizon_score(in_group[i]['id'], fixtures_data), 1)
-                            } 
-                            for i in range(target_transfers)
-                        ],
-                        "hit_penalty": hit_penalty,
-                        "net_gain": round(net_gain, 2),
-                        "bank_left": round((combined_cost - sum(t['cost'] for t in in_group)) / 10.0, 1)
-                    }
+            for in_group in itertools.product(*positional_targets):
+                if len({t['id'] for t in in_group}) < target_transfers:
+                    continue
+
+                in_club_counts = dict(club_counts)
+                club_limit_ok = True
+                for t in in_group:
+                    club = t.get('team')
+                    if club is not None:
+                        in_club_counts[club] = in_club_counts.get(club, 0) + 1
+                        if in_club_counts[club] > 3:
+                            club_limit_ok = False
+                            break
+                if not club_limit_ok:
+                    continue
                     
-    return best_package
+                if sum(t['cost'] for t in in_group) <= combined_cost:
+                    out_score = sum(calculate_horizon_score(p['id'], fixtures_data) for p in out_group)
+                    in_score = sum(calculate_horizon_score(t['id'], fixtures_data) for t in in_group)
+                    
+                    gain = in_score - out_score
+                    net_gain = gain - hit_penalty
+                    
+                    if net_gain > max_net_gain:
+                        max_net_gain = net_gain
+                        best_package = {
+                            "package_type": f"{target_transfers}-Transfer Package",
+                            "moves": [
+                                {
+                                    "out_name": out_group[i]['name'],
+                                    "out_pos": out_group[i]['position'],
+                                    "out_xp": round(calculate_horizon_score(out_group[i]['id'], fixtures_data), 1),
+                                    "in_name": in_group[i]['name'],
+                                    "in_cost": in_group[i]['cost'] / 10.0,
+                                    "in_xp": round(calculate_horizon_score(in_group[i]['id'], fixtures_data), 1)
+                                } 
+                                for i in range(target_transfers)
+                            ],
+                            "hit_penalty": hit_penalty,
+                            "net_gain": round(net_gain, 2),
+                            "bank_left": round((combined_cost - sum(t['cost'] for t in in_group)) / 10.0, 1)
+                        }
+                        
+        return best_package
+    except Exception as e:
+        logger.error(f"Error in recommend_transfer_package: {e}\n{traceback.format_exc()}")
+        return None
 
 
 # ==========================================
@@ -213,56 +204,51 @@ def recommend_transfer_package(
 # ==========================================
 
 async def check_deadline_job(context: ContextTypes.DEFAULT_TYPE):
-    job_data = context.job.data
-    chat_id = job_data.get("chat_id")
-    if not chat_id:
-        return
+    """Safely executes background deadline checks without taking down the job loop on error."""
+    try:
+        job_data = context.job.data
+        chat_id = job_data.get("chat_id")
+        if not chat_id:
+            return
 
-    next_gw = get_next_deadline_info()
-    if not next_gw:
-        return
+        next_gw = get_next_deadline_info()
+        if not next_gw:
+            return
 
-    gw_id = next_gw["id"]
-    gw_name = next_gw["name"]
-    deadline = next_gw["deadline_time"]
-    now = datetime.now(timezone.utc)
-    
-    hours_left = (deadline - now).total_seconds() / 3600.0
+        gw_id = next_gw["id"]
+        gw_name = next_gw["name"]
+        deadline = next_gw["deadline_time"]
+        now = datetime.now(timezone.utc)
+        
+        hours_left = (deadline - now).total_seconds() / 3600.0
 
-    # Deadline has passed: nothing left to alert on for this gameweek, so
-    # drop its tracker entry instead of letting ALERT_TRACKER grow forever.
-    if hours_left <= 0:
-        ALERT_TRACKER.pop(gw_id, None)
-        return
+        if hours_left <= 0:
+            ALERT_TRACKER.pop(gw_id, None)
+            return
 
-    if gw_id not in ALERT_TRACKER:
-        ALERT_TRACKER[gw_id] = {48: False, 24: False, 12: False, 2: False}
+        if gw_id not in ALERT_TRACKER:
+            ALERT_TRACKER[gw_id] = {48: False, 24: False, 12: False, 2: False}
 
-    # Also drop tracker entries for any older gameweeks still lingering
-    # (e.g. left behind if a deadline was ever missed while offline).
-    for old_gw_id in [g for g in ALERT_TRACKER if g != gw_id and g < gw_id]:
-        ALERT_TRACKER.pop(old_gw_id, None)
+        for old_gw_id in [g for g in ALERT_TRACKER if g != gw_id and g < gw_id]:
+            ALERT_TRACKER.pop(old_gw_id, None)
 
-    # No lower bound here: if the bot was offline and skipped straight past
-    # a milestone (e.g. hours_left dropped from 50 to 20 between polls), the
-    # 48h and 24h alerts still fire late instead of being silently skipped.
-    # Only one alert is sent per run (via break); any others still pending
-    # catch up on subsequent polls.
-    milestones = [48, 24, 12, 2]
+        milestones = [48, 24, 12, 2]
 
-    for target_hr in milestones:
-        if hours_left <= target_hr and not ALERT_TRACKER[gw_id][target_hr]:
-            alert_message = (
-                f"🚨 **FPL Deadline Alert!**\n\n"
-                f"⏰ **{gw_name} deadline is in ~{target_hr} hours!**\n"
-                f"Make sure your transfers, captaincy, and chips are locked in."
-            )
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=alert_message, parse_mode="Markdown")
-                ALERT_TRACKER[gw_id][target_hr] = True
-            except Exception as e:
-                logger.error(f"Failed to send deadline reminder: {e}")
-            break
+        for target_hr in milestones:
+            if hours_left <= target_hr and not ALERT_TRACKER[gw_id][target_hr]:
+                alert_message = (
+                    f"🚨 **FPL Deadline Alert!**\n\n"
+                    f"⏰ **{gw_name} deadline is in ~{target_hr} hours!**\n"
+                    f"Make sure your transfers, captaincy, and chips are locked in."
+                )
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=alert_message, parse_mode="Markdown")
+                    ALERT_TRACKER[gw_id][target_hr] = True
+                except Exception as send_err:
+                    logger.error(f"Failed to send deadline reminder message: {send_err}")
+                break
+    except Exception as e:
+        logger.error(f"Critical error in check_deadline_job: {e}\n{traceback.format_exc()}")
 
 
 # ==========================================
@@ -270,88 +256,96 @@ async def check_deadline_job(context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
-    if not current_jobs:
-        context.job_queue.run_repeating(
-            check_deadline_job, 
-            interval=1800, 
-            first=10, 
-            data={"chat_id": chat_id}, 
-            name=str(chat_id)
-        )
+    try:
+        chat_id = update.effective_chat.id
+        current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+        if not current_jobs:
+            context.job_queue.run_repeating(
+                check_deadline_job, 
+                interval=1800, 
+                first=10, 
+                data={"chat_id": chat_id}, 
+                name=str(chat_id)
+            )
 
-    welcome_text = (
-        "👋 **Welcome to your FPL Assistant Bot!**\n\n"
-        "✅ **Automated Deadline Reminders Active:** Alerts set for 48h, 24h, 12h, and 2h before deadlines.\n\n"
-        "**Commands:**\n"
-        "• `/transfers [1-4]` - Get optimized single or multi-transfer packages.\n"
-        "*(Example: `/transfers 3` to evaluate a 3-transfer package)*"
-    )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+        welcome_text = (
+            "👋 **Welcome to your FPL Assistant Bot!**\n\n"
+            "✅ **Automated Deadline Reminders Active:** Alerts set for 48h, 24h, 12h, and 2h before deadlines.\n\n"
+            "**Commands:**\n"
+            "• `/transfers [1-4]` - Get optimized single or multi-transfer packages.\n"
+            "*(Example: `/transfers 3` to evaluate a 3-transfer package)*"
+        )
+        await update.message.reply_text(welcome_text, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Error in start_command: {e}\n{traceback.format_exc()}")
+        await update.message.reply_text("❌ An error occurred while starting the bot. Please try again.")
 
 async def transfers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target_count = 1
-    if context.args and context.args[0].isdigit():
-        target_count = int(context.args[0])
+    try:
+        target_count = 1
+        if context.args and context.args[0].isdigit():
+            target_count = int(context.args[0])
+            
+        target_count = max(1, min(4, target_count))
         
-    target_count = max(1, min(4, target_count))
-    
-    await update.message.reply_text(f"🔄 Analyzing market for the best **{target_count}-transfer package**...", parse_mode="Markdown")
-    
-    # --- MOCK DATA (Replace with your database/API bindings) ---
-    banked_fts = 2  
-    bank = 15       # £1.5m in the bank (stored in tenths)
-    squad_players = [
-        {"id": 1, "name": "Saka", "position": "MID", "purchase_price": 95, "current_price": 100, "team": "ARS"},
-        {"id": 2, "name": "Haaland", "position": "FWD", "purchase_price": 140, "current_price": 150, "team": "MCI"},
-        {"id": 3, "name": "Pickford", "position": "GKP", "purchase_price": 50, "current_price": 50, "team": "EVE"},
-        {"id": 4, "name": "Gabriel", "position": "DEF", "purchase_price": 60, "current_price": 62, "team": "ARS"},
-        {"id": 5, "name": "Bowen", "position": "MID", "purchase_price": 75, "current_price": 75, "team": "WHU"},
-    ]
-    player_pool = [
-        {"id": 101, "name": "Palmer", "position": "MID", "cost": 105, "chance_of_playing": 100, "team": "CHE"},
-        {"id": 102, "name": "Isak", "position": "FWD", "cost": 85, "chance_of_playing": 100, "team": "NEW"},
-        {"id": 103, "name": "Raya", "position": "GKP", "cost": 55, "chance_of_playing": 100, "team": "ARS"},
-        {"id": 104, "name": "Saliba", "position": "DEF", "cost": 60, "chance_of_playing": 100, "team": "ARS"},
-        {"id": 105, "name": "Mbeumo", "position": "MID", "cost": 75, "chance_of_playing": 100, "team": "BRE"},
-    ]
-    fixtures_data = {
-        1: [{"expected_points": 3.2}, {"expected_points": 4.1}, {"expected_points": 2.5}],
-        2: [{"expected_points": 2.1}, {"expected_points": 1.8}, {"expected_points": 2.0}],
-        3: [{"expected_points": 1.0}, {"expected_points": 0.9}, {"expected_points": 1.2}],
-        4: [{"expected_points": 1.5}, {"expected_points": 1.0}, {"expected_points": 1.1}],
-        5: [{"expected_points": 1.2}, {"expected_points": 1.1}, {"expected_points": 1.0}],
-        101: [{"expected_points": 7.5}, {"expected_points": 6.8}, {"expected_points": 7.1}],
-        102: [{"expected_points": 6.0}, {"expected_points": 6.2}, {"expected_points": 6.8}],
-        103: [{"expected_points": 4.5}, {"expected_points": 4.2}, {"expected_points": 4.8}],
-        104: [{"expected_points": 4.0}, {"expected_points": 4.1}, {"expected_points": 4.3}],
-        105: [{"expected_points": 5.5}, {"expected_points": 5.2}, {"expected_points": 5.0}],
-    }
-    # -------------------------------------------------------------------
-    
-    result = recommend_transfer_package(
-        squad_players, player_pool, bank, banked_fts, fixtures_data, target_transfers=target_count
-    )
-    
-    if not result:
-        await update.message.reply_text(f"❌ No viable {target_count}-transfer packages found within your current budget and positional constraints.")
-        return
+        await update.message.reply_text(f"🔄 Analyzing market for the best **{target_count}-transfer package**...", parse_mode="Markdown")
         
-    msg = f"🔀 **Recommended {result['package_type']}**\n"
-    if result['hit_penalty'] > 0:
-        msg += f"⚠️ *Includes a hit penalty of -{result['hit_penalty']} pts*\n\n"
-    else:
-        msg += f"✅ *Fully covered by Free Transfers*\n\n"
+        # --- MOCK DATA (Replace with your database/API bindings) ---
+        banked_fts = 2  
+        bank = 15       # £1.5m in the bank (stored in tenths)
+        squad_players = [
+            {"id": 1, "name": "Saka", "position": "MID", "purchase_price": 95, "current_price": 100, "team": "ARS"},
+            {"id": 2, "name": "Haaland", "position": "FWD", "purchase_price": 140, "current_price": 150, "team": "MCI"},
+            {"id": 3, "name": "Pickford", "position": "GKP", "purchase_price": 50, "current_price": 50, "team": "EVE"},
+            {"id": 4, "name": "Gabriel", "position": "DEF", "purchase_price": 60, "current_price": 62, "team": "ARS"},
+            {"id": 5, "name": "Bowen", "position": "MID", "purchase_price": 75, "current_price": 75, "team": "WHU"},
+        ]
+        player_pool = [
+            {"id": 101, "name": "Palmer", "position": "MID", "cost": 105, "chance_of_playing": 100, "team": "CHE"},
+            {"id": 102, "name": "Isak", "position": "FWD", "cost": 85, "chance_of_playing": 100, "team": "NEW"},
+            {"id": 103, "name": "Raya", "position": "GKP", "cost": 55, "chance_of_playing": 100, "team": "ARS"},
+            {"id": 104, "name": "Saliba", "position": "DEF", "cost": 60, "chance_of_playing": 100, "team": "ARS"},
+            {"id": 105, "name": "Mbeumo", "position": "MID", "cost": 75, "chance_of_playing": 100, "team": "BRE"},
+        ]
+        fixtures_data = {
+            1: [{"expected_points": 3.2}, {"expected_points": 4.1}, {"expected_points": 2.5}],
+            2: [{"expected_points": 2.1}, {"expected_points": 1.8}, {"expected_points": 2.0}],
+            3: [{"expected_points": 1.0}, {"expected_points": 0.9}, {"expected_points": 1.2}],
+            4: [{"expected_points": 1.5}, {"expected_points": 1.0}, {"expected_points": 1.1}],
+            5: [{"expected_points": 1.2}, {"expected_points": 1.1}, {"expected_points": 1.0}],
+            101: [{"expected_points": 7.5}, {"expected_points": 6.8}, {"expected_points": 7.1}],
+            102: [{"expected_points": 6.0}, {"expected_points": 6.2}, {"expected_points": 6.8}],
+            103: [{"expected_points": 4.5}, {"expected_points": 4.2}, {"expected_points": 4.8}],
+            104: [{"expected_points": 4.0}, {"expected_points": 4.1}, {"expected_points": 4.3}],
+            105: [{"expected_points": 5.5}, {"expected_points": 5.2}, {"expected_points": 5.0}],
+        }
+        # -------------------------------------------------------------------
         
-    for move in result['moves']:
-        msg += f"🔴 Out: `{move['out_name']}` ({move['out_pos']}) — {move['out_xp']} xP\n"
-        msg += f"🟢 In: `{move['in_name']}` (£{move['in_cost']}m) — {move['in_xp']} xP\n\n"
+        result = recommend_transfer_package(
+            squad_players, player_pool, bank, banked_fts, fixtures_data, target_transfers=target_count
+        )
         
-    msg += f"📈 **Net Projected Horizon Gain:** +{result['net_gain']} pts\n"
-    msg += f"💰 **Bank After:** £{result['bank_left']}m"
-    
-    await update.message.reply_text(msg, parse_mode="Markdown")
+        if not result:
+            await update.message.reply_text(f"❌ No viable {target_count}-transfer packages found within your current budget and positional constraints.")
+            return
+            
+        msg = f"🔀 **Recommended {result['package_type']}**\n"
+        if result['hit_penalty'] > 0:
+            msg += f"⚠️ *Includes a hit penalty of -{result['hit_penalty']} pts*\n\n"
+        else:
+            msg += f"✅ *Fully covered by Free Transfers*\n\n"
+            
+        for move in result['moves']:
+            msg += f"🔴 Out: `{move['out_name']}` ({move['out_pos']}) — {move['out_xp']} xP\n"
+            msg += f"🟢 In: `{move['in_name']}` (£{move['in_cost']}m) — {move['in_xp']} xP\n\n"
+            
+        msg += f"📈 **Net Projected Horizon Gain:** +{result['net_gain']} pts\n"
+        msg += f"💰 **Bank After:** £{result['bank_left']}m"
+        
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Error in transfers_command: {e}\n{traceback.format_exc()}")
+        await update.message.reply_text("❌ An unexpected error occurred while calculating your transfer package.")
 
 
 # ==========================================
@@ -369,7 +363,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("transfers", transfers_command))
 
-    logger.info("🤖 FPL Bot with multi-transfer package engine is running...")
+    logger.info("🤖 FPL Bot with robust error handling is running...")
     app.run_polling()
 
 if __name__ == "__main__":
