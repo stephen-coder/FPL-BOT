@@ -4,7 +4,7 @@ import asyncio
 from threading import Thread
 import pulp
 import requests
-from flask import Flask, request, Response
+from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler
 
@@ -15,32 +15,6 @@ logger = logging.getLogger(__name__)
 
 # --- Flask Server Setup for Render Health Checks ---
 app = Flask(__name__)
-def start_telegram_bot():
-    BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN environment variable is missing!")
-        return
-
-    bot_instance = FPLBot()
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", bot_instance.start))
-    application.add_handler(CommandHandler("setteam", bot_instance.set_team))
-    application.add_handler(CommandHandler("squad", bot_instance.squad))
-    application.add_handler(CommandHandler("freehit", bot_instance.free_hit))
-    application.add_handler(CommandHandler("transfers", bot_instance.transfers))
-    application.add_handler(CommandHandler("hits", bot_instance.hits))
-
-    logger.info("Starting FPL Telegram Bot via Polling...")
-    application.run_polling()
-
-if __name__ == "__main__":
-    # Local testing fallback
-    web_thread = Thread(target=run_web)
-    web_thread.daemon = True
-    web_thread.start()
-    start_telegram_bot()
-
 
 @app.route('/')
 def health_check():
@@ -103,15 +77,6 @@ class FPLBot:
             logger.error(f"Error fetching manager GW picks for team {team_id} GW {gw}: {e}")
             return None
 
-    def fetch_live_gwdata(self, gw):
-        try:
-            response = self.session.get(f"{FPL_BASE_URL}event/{gw}/live/", timeout=15)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"Error fetching live data for GW {gw}: {e}")
-            return None
-
     def _get_target_and_pick_gw(self, data):
         events = data['events']
         next_gw = next((gw['id'] for gw in events if gw.get('is_next')), None)
@@ -135,53 +100,47 @@ class FPLBot:
         chance = 100 if chance is None else chance
         return status == 'a' and chance >= 75
 
-    def _get_single_gw_score(self, player, fixtures, target_gw):
+    # --- Centralized xPts Engine ---
+    def _calculate_single_gw_xpts(self, player, fixtures, target_gw):
         team_id = player['team']
         base_ep = float(player.get('ep_next', 0) or 0)
         form = float(player.get('form', 0) or 0)
-        available = self._is_available(player)
-
-        if not available:
+        
+        if not self._is_available(player):
             return -50.0
 
         gw_fixtures = [f for f in fixtures if f['event'] == target_gw and (f['team_h'] == team_id or f['team_a'] == team_id)]
         if not gw_fixtures:
-            return float(player.get('ep_next', 2.0) or 2.0)
+            return max(base_ep, 2.0)
         
         total_gw_score = 0.0
         for f in gw_fixtures:
             is_home = (f['team_h'] == team_id)
             fdr = f['team_h_difficulty'] if is_home else f['team_a_difficulty']
-            gw_score = (base_ep * 2.0) + (form * 0.5) - (fdr * 0.8)
+            # Blended heuristic model: ep_next weight + form weight - FDR penalty
+            gw_score = (base_ep * 1.8) + (form * 0.4) - (fdr * 0.7)
             total_gw_score += max(gw_score, 0.5)
 
         return total_gw_score
 
-    def _get_3gw_score(self, player, fixtures, start_gw):
-        team_id = player['team']
-        base_ep = float(player.get('ep_next', 0) or 0)
-        form = float(player.get('form', 0) or 0)
-        available = self._is_available(player)
+    def _calculate_horizon_xpts(self, player, fixtures, start_gw, horizon=3):
+        if not self._is_available(player):
+            return -100.0
 
-        if not available:
-            return -50.0 - (3 * 20)
-
+        decay_weights = [1.0, 0.8, 0.6]  # Uncertainty decay across horizon weeks
         total_score = 0.0
-        for gw_offset in range(3):
-            gw = start_gw + gw_offset
-            gw_fixtures = [f for f in fixtures if f['event'] == gw and (f['team_h'] == team_id or f['team_a'] == team_id)]
-            
-            if not gw_fixtures:
-                continue
-            
-            for f in gw_fixtures:
-                is_home = (f['team_h'] == team_id)
-                fdr = f['team_h_difficulty'] if is_home else f['team_a_difficulty']
-                gw_score = (base_ep * 2.0) + (form * 0.5) - (fdr * 0.8)
-                total_score += max(gw_score, 0.5)
+
+        for offset in range(horizon):
+            gw = start_gw + offset
+            weight = decay_weights[offset] if offset < len(decay_weights) else 0.5
+            gw_score = self._calculate_single_gw_xpts(player, fixtures, gw)
+            if gw_score < -10:  # Unavailable flag penalty
+                return -100.0
+            total_score += (gw_score * weight)
 
         return total_score
 
+    # --- ILP Solvers ---
     def _solve_best_xi(self, pool):
         if len(pool) < 11:
             return [], []
@@ -243,16 +202,16 @@ class FPLBot:
             return []
         return [p for p in candidates if pulp.value(pick[p['id']]) == 1]
 
-    # Telegram Handlers
+    # --- Telegram Handlers ---
     async def start(self, update: Update, context):
         welcome_text = (
             "⚽ **Welcome to the FPL Assistant Bot!**\n\n"
             "**Core Commands:**\n"
             "• `/setteam <ID>` - Link your FPL Team ID\n"
             "• `/squad` - Optimal starting XI for the immediate GW\n"
-            "• `/freehit` - Generate optimal Free Hit squad (3-GW Horizon)\n"
-            "• `/transfers` - 3-GW Horizon transfer suggestion\n"
-            "• `/hits` - Multi-week net gain analysis for taking a hit (-4)"
+            "• `/freehit` - Generate 3-GW Horizon Free Hit squad\n"
+            "• `/transfers` - Marginal EV transfer suggestions\n"
+            "• `/hits` - Multi-week net gain (-4) valuation analysis"
         )
         await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -267,14 +226,14 @@ class FPLBot:
             await update.message.reply_text("❌ Invalid Team ID format. It should be a number.")
             return
 
-        self.user_data_store[chat_id] = team_id
         manager = self.fetch_manager_data(team_id)
         if manager:
+            self.user_data_store[chat_id] = team_id
             name = f"{manager.get('player_first_name', '')} {manager.get('player_last_name', '')}"
             team_name = manager.get('name', 'Unknown Team')
             await update.message.reply_text(f"✅ Successfully linked!\n👤 **Manager:** {name}\n🛡️ **Team:** {team_name}")
         else:
-            await update.message.reply_text("⚠️ Team ID saved, but could not verify details from FPL API.")
+            await update.message.reply_text("❌ Could not verify Team ID from FPL API. Please check and try again.")
 
     async def squad(self, update: Update, context):
         chat_id = update.effective_chat.id
@@ -288,7 +247,7 @@ class FPLBot:
         data = self.fetch_bootstrap_static()
         fixtures = self.fetch_fixtures()
         if not data or not fixtures:
-            await update.message.reply_text("❌ FPL API or fixtures unreachable.")
+            await update.message.reply_text("❌ FPL API unreachable.")
             return
 
         target_gw, pick_gw = self._get_target_and_pick_gw(data)
@@ -304,14 +263,13 @@ class FPLBot:
             p_info = players_dict.get(pick['element'])
             if not p_info:
                 continue
-            score = self._get_single_gw_score(p_info, fixtures, target_gw)
-            available = self._is_available(p_info)
+            score = self._calculate_single_gw_xpts(p_info, fixtures, target_gw)
             pool.append({
                 'id': p_info['id'],
                 'name': p_info['web_name'],
                 'element_type': p_info['element_type'],
                 'now_cost': p_info['now_cost'] / 10.0,
-                'available': available,
+                'available': self._is_available(p_info),
                 'score': score,
             })
 
@@ -339,7 +297,7 @@ class FPLBot:
         await update.message.reply_text("\n".join(report), parse_mode="Markdown")
 
     async def free_hit(self, update: Update, context):
-        await update.message.reply_text("⚡ Generating 3-GW Optimized Free Hit squad...")
+        await update.message.reply_text("⚡ Generating 3-GW Horizon Optimized Free Hit squad...")
         data = self.fetch_bootstrap_static()
         fixtures = self.fetch_fixtures()
         if not data or not fixtures:
@@ -352,7 +310,7 @@ class FPLBot:
         for p in data['elements']:
             if not self._is_available(p):
                 continue
-            score = self._get_3gw_score(p, fixtures, target_gw)
+            score = self._calculate_horizon_xpts(p, fixtures, target_gw, horizon=3)
             candidates.append({
                 'id': p['id'],
                 'name': p['web_name'],
@@ -394,7 +352,7 @@ class FPLBot:
             await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
             return
 
-        await update.message.reply_text("🔄 Scanning 3-week fixture blocks for optimal transfers...")
+        await update.message.reply_text("🔄 Analyzing marginal EV for transfer options...")
 
         data = self.fetch_bootstrap_static()
         fixtures = self.fetch_fixtures()
@@ -417,7 +375,7 @@ class FPLBot:
             p = players_dict.get(pick['element'])
             if not p:
                 continue
-            score = self._get_3gw_score(p, fixtures, target_gw)
+            score = self._calculate_horizon_xpts(p, fixtures, target_gw, horizon=3)
             owned.append({
                 'id': p['id'], 'name': p['web_name'], 'element_type': p['element_type'],
                 'cost': p['now_cost'] / 10.0, 'score': score,
@@ -436,23 +394,23 @@ class FPLBot:
             and self._is_available(p) and (p['now_cost'] / 10.0) <= max_budget
         ]
         if not candidates:
-            await update.message.reply_text(f"✅ Your lowest 3-GW rated player ({weakest['name']}) has no affordable upgrades.")
+            await update.message.reply_text(f"✅ Your lowest rated player ({weakest['name']}) has no affordable upgrades.")
             return
 
-        best = max(candidates, key=lambda p: self._get_3gw_score(p, fixtures, target_gw))
-        best_score = self._get_3gw_score(best, fixtures, target_gw)
+        best = max(candidates, key=lambda p: self._calculate_horizon_xpts(p, fixtures, target_gw, horizon=3))
+        best_score = self._calculate_horizon_xpts(best, fixtures, target_gw, horizon=3)
         gain = best_score - weakest['score']
 
         if gain <= 1.5:
-            await update.message.reply_text(f"✅ Squad looks well-balanced for the next 3 weeks — no transfer clears the gain threshold.")
+            await update.message.reply_text(f"✅ Squad is well-optimized — no transfer clears the marginal gain threshold.")
             return
 
         remaining_bank = max_budget - (best['now_cost'] / 10.0)
         report = [
-            f"🔄 **Horizon Transfer Suggestion (GW {target_gw}-{target_gw+2})**\n",
+            f"🔄 **Marginal Transfer Suggestion (GW {target_gw}-{target_gw+2})**\n",
             f"🔴 **OUT:** [{POS_NAME[weakest['element_type']]}] {weakest['name']} (£{weakest['cost']}m) — 3-GW xP: {weakest['score']:.1f}",
             f"🟢 **IN:** [{POS_NAME[best['element_type']]}] {best['web_name']} (£{best['now_cost']/10.0}m) — 3-GW xP: {best_score:.1f}",
-            f"📈 **3-Week Projected Gain:** +{gain:.1f} xP",
+            f"📈 **Projected Marginal Gain:** +{gain:.1f} xP",
             f"💰 **Bank After:** £{remaining_bank:.1f}m",
         ]
         await update.message.reply_text("\n".join(report), parse_mode="Markdown")
@@ -464,7 +422,7 @@ class FPLBot:
             await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
             return
 
-        await update.message.reply_text("💡 Running multi-week hit (-4) valuation analysis...")
+        await update.message.reply_text("💡 Running net-gain hit valuation analysis with safety buffer...")
 
         data = self.fetch_bootstrap_static()
         fixtures = self.fetch_fixtures()
@@ -487,7 +445,7 @@ class FPLBot:
             p = players_dict.get(pick['element'])
             if not p:
                 continue
-            score = self._get_3gw_score(p, fixtures, target_gw)
+            score = self._calculate_horizon_xpts(p, fixtures, target_gw, horizon=3)
             owned.append({
                 'id': p['id'], 'name': p['web_name'], 'element_type': p['element_type'],
                 'cost': p['now_cost'] / 10.0, 'score': score,
@@ -506,51 +464,21 @@ class FPLBot:
             and self._is_available(p) and (p['now_cost'] / 10.0) <= max_budget
         ]
         if not candidates:
-            await update.message.reply_text(f"✅ Your lowest 3-GW rated player ({weakest['name']}) has no affordable upgrade for a hit analysis.")
+            await update.message.reply_text(f"✅ Your lowest rated player ({weakest['name']}) has no upgrade candidates.")
             return
 
-        best = max(candidates, key=lambda p: self._get_3gw_score(p, fixtures, target_gw))
-        best_score = self._get_3gw_score(best, fixtures, target_gw)
+        best = max(candidates, key=lambda p: self._calculate_horizon_xpts(p, fixtures, target_gw, horizon=3))
+        best_score = self._calculate_horizon_xpts(best, fixtures, target_gw, horizon=3)
         gain = best_score - weakest['score']
-        net_gain = gain - 4.0
-
-        if net_gain > 0:
-            remaining_bank = max_budget - (best['now_cost'] / 10.0)
-            report = [
-                f"💡 **Hit (-4) Recommendation (GW {target_gw}-{target_gw+2})**\n",
-                f"🔴 **OUT:** [{POS_NAME[weakest['element_type']]}] {weakest['name']} (£{weakest['cost']}m) — 3-GW xP: {weakest['score']:.1f}",
-                f"🟢 **IN:** [{POS_NAME[best['element_type']]}] {best['web_name']} (£{best['now_cost']/10.0}m) — 3-GW xP: {best_score:.1f}",
-                f"📈 **Net Gain after -4 hit:** +{net_gain:.1f} xP",
-                f"💰 **Bank After:** £{remaining_bank:.1f}m",
-            ]
-        else:
-            report = [
-                f"💡 **Hit (-4) Analysis (GW {target_gw}-{target_gw+2})**\n",
-                f"❌ Taking a hit to replace {weakest['name']} with {best['web_name']} is **not recommended**.",
-                f"📈 Projected gain (+{gain:.1f} xP) does not outweigh the 4-point hit cost (Net: {net_gain:.1f} xP)."
-            ]
-        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
-
-# --- Execution Entry Point ---
-if __name__ == "__main__":
+def start_telegram_bot():
     BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     if not BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN environment variable is missing!")
-        exit(1)
+        return
 
-    # Start the Flask web server in a background thread so Render's port bind succeeds
-    web_thread = Thread(target=run_web)
-    web_thread.daemon = True
-    web_thread.start()
-    logger.info("Background Flask health check server started.")
-
-    # Instantiate Bot
     bot_instance = FPLBot()
-    
-    # Build Telegram Application
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Register Command Handlers
     application.add_handler(CommandHandler("start", bot_instance.start))
     application.add_handler(CommandHandler("setteam", bot_instance.set_team))
     application.add_handler(CommandHandler("squad", bot_instance.squad))
@@ -560,3 +488,13 @@ if __name__ == "__main__":
 
     logger.info("Starting FPL Telegram Bot via Polling...")
     application.run_polling()
+
+# --- Execution Entry Point ---
+if __name__ == "__main__":
+    # Local testing fallback
+    web_thread = Thread(target=run_web)
+    web_thread.daemon = True
+    web_thread.start()
+    logger.info("Background Flask health check server started.")
+    
+    start_telegram_bot()
