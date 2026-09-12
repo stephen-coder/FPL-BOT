@@ -142,6 +142,39 @@ class FPLBot:
                 return None
         return await asyncio.to_thread(fetch)
 
+    async def _fetch_manager_history(self, team_id):
+        def fetch():
+            try:
+                res = self.session.get(f"{FPL_BASE_URL}entry/{team_id}/history/", timeout=15)
+                res.raise_for_status()
+                return res.json()
+            except Exception as e:
+                logger.error(f"Error fetching manager history for team {team_id}: {e}")
+                return None
+        return await asyncio.to_thread(fetch)
+
+    def _estimate_free_transfers(self, history_data, upto_event):
+        """Reconstruct banked free transfers heading into the gameweek after `upto_event`,
+        using FPL's accrual rules: +1 FT per gameweek (capped at 5), and Wildcard/Free Hit
+        weeks don't touch the bank since they grant unlimited free transfers that week.
+        Falls back to 1 (the safe default most managers are near) if history is unavailable."""
+        if not history_data or 'current' not in history_data:
+            return 1
+
+        chip_events = {c['event']: c['name'] for c in history_data.get('chips', [])}
+        ft = 1
+        for row in sorted(history_data['current'], key=lambda r: r['event']):
+            event = row['event']
+            if event > upto_event:
+                break
+            transfers_made = row.get('event_transfers', 0) or 0
+            if chip_events.get(event) in ('wildcard', 'freehit'):
+                transfers_made = 0
+            if event > 1:
+                ft = min(ft + 1, 5)
+            ft = max(0, ft - transfers_made)
+        return ft
+
     def _get_target_and_pick_gw(self, data):
         events = data['events']
         next_gw = next((gw['id'] for gw in events if gw.get('is_next')), None)
@@ -159,19 +192,37 @@ class FPLBot:
 
         return target_gw, pick_gw
 
-    def _is_available(self, p):
+    def _is_hard_excluded(self, p):
+        """Genuinely out regardless of how far out we're projecting: injured, suspended,
+        left the club, etc. 'doubtful' (status 'd') is handled separately since that's a
+        near-term fitness call, not a season-long exclusion."""
         status = p.get('status', 'a')
-        chance = p.get('chance_of_playing_next_round', 100)
-        chance = 100 if chance is None else chance
-        return status == 'a' and chance >= 75
+        return status not in ('a', 'd')
+
+    def _is_doubtful(self, p):
+        status = p.get('status', 'a')
+        if status == 'd':
+            return True
+        chance = p.get('chance_of_playing_next_round')
+        return chance is not None and chance < 100
+
+    def _availability_multiplier(self, p):
+        chance = p.get('chance_of_playing_next_round')
+        if chance is None:
+            return 0.75 if p.get('status') == 'd' else 1.0
+        return chance / 100.0
+
+    def _is_available(self, p):
+        """'Fully fit' — used for display flags (e.g. the ⚠️ Doubt tag), not for scoring."""
+        return not self._is_hard_excluded(p) and not self._is_doubtful(p)
 
     # --- Centralized xPts Engine ---
-    def _calculate_single_gw_xpts(self, player, fixtures, target_gw):
+    def _calculate_single_gw_xpts(self, player, fixtures, target_gw, apply_doubt_penalty=True):
         team_id = player['team']
         base_ep = float(player.get('ep_next', 0) or 0)
         form = float(player.get('form', 0) or 0)
 
-        if not self._is_available(player):
+        if self._is_hard_excluded(player):
             return -50.0
 
         gw_fixtures = [f for f in fixtures if f['event'] == target_gw and (f['team_h'] == team_id or f['team_a'] == team_id)]
@@ -187,21 +238,26 @@ class FPLBot:
             gw_score = (base_ep * 1.8) + (form * 0.4) - (fdr * 0.7)
             total_gw_score += max(gw_score, 0.5)
 
+        # chance_of_playing_next_round is a near-term fitness signal — only apply it when
+        # this call represents the immediate upcoming gameweek, not a future one in a horizon.
+        if apply_doubt_penalty and self._is_doubtful(player):
+            total_gw_score *= self._availability_multiplier(player)
+
         return total_gw_score
 
     def _calculate_horizon_xpts(self, player, fixtures, start_gw, horizon=3):
-        if not self._is_available(player):
+        if self._is_hard_excluded(player):
             return -100.0
 
-        decay_weights = [1.0, 0.8, 0.6]
+        decay_weights = [1.0, 0.85, 0.7, 0.55]
         total_score = 0.0
 
         for offset in range(horizon):
             gw = start_gw + offset
             weight = decay_weights[offset] if offset < len(decay_weights) else max(0.2, 1.0 - (offset * 0.2))
-            gw_score = self._calculate_single_gw_xpts(player, fixtures, gw)
-            if gw_score < -10:
-                return -100.0
+            # Only the immediate gameweek (offset 0) gets discounted for current doubt status —
+            # a player who's 50% for this week is usually assumed fit again a few weeks out.
+            gw_score = self._calculate_single_gw_xpts(player, fixtures, gw, apply_doubt_penalty=(offset == 0))
             total_score += (gw_score * weight)
 
         return total_score
@@ -275,7 +331,7 @@ class FPLBot:
         return await asyncio.to_thread(solve)
 
     # --- Shared Squad/Candidate Pool Builder (uses pick_gw for the real squad, target_gw for horizon scoring) ---
-    async def _build_transfer_pools(self, team_id, pick_gw, target_gw, fixtures, data):
+    async def _build_transfer_pools(self, team_id, pick_gw, target_gw, fixtures, data, horizon=3):
         picks_data = await self._fetch_manager_gw_picks(team_id, pick_gw)
         if not picks_data or 'picks' not in picks_data:
             return None
@@ -291,7 +347,7 @@ class FPLBot:
             p = players_dict.get(pick['element'])
             if not p:
                 continue
-            score = self._calculate_horizon_xpts(p, fixtures, target_gw, horizon=3)
+            score = self._calculate_horizon_xpts(p, fixtures, target_gw, horizon=horizon)
             owned_pool.append({
                 'id': p['id'], 'name': p['web_name'], 'element_type': p['element_type'],
                 'cost': p['now_cost'] / 10.0, 'team': p['team'], 'score': score,
@@ -301,9 +357,9 @@ class FPLBot:
 
         candidates_pool = []
         for p in data['elements']:
-            if p['id'] in owned_ids or not self._is_available(p):
+            if p['id'] in owned_ids or self._is_hard_excluded(p):
                 continue
-            score = self._calculate_horizon_xpts(p, fixtures, target_gw, horizon=3)
+            score = self._calculate_horizon_xpts(p, fixtures, target_gw, horizon=horizon)
             candidates_pool.append({
                 'id': p['id'], 'name': p['web_name'], 'element_type': p['element_type'],
                 'cost': p['now_cost'] / 10.0, 'team': p['team'], 'score': score,
@@ -363,9 +419,15 @@ class FPLBot:
             "**Core Commands:**\n"
             "• `/setteam <ID>` - Link your FPL Team ID\n"
             "• `/squad` - Optimal starting XI for the immediate GW\n"
-            "• `/freehit` - Generate 3-GW Horizon Free Hit squad\n"
+            "• `/freehit` - Generate optimal Free Hit squad for the upcoming GW\n"
             "• `/transfers` - Marginal EV transfer suggestions\n"
-            "• `/hits` - Multi-week net gain (-4) valuation analysis"
+            "• `/hits` - Multi-week net gain (-4) valuation analysis\n\n"
+            "**Chip Planning:**\n"
+            "• `/wildcard` - Long-horizon (6-GW) squad rebuild\n"
+            "• `/bboost` - Best upcoming week for Bench Boost\n"
+            "• `/triplecap` - Best upcoming week for Triple Captain\n\n"
+            "**Research:**\n"
+            "• `/differentials [max%] [POS]` - Low-ownership picks by xP"
         )
         await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -457,7 +519,7 @@ class FPLBot:
             await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
             return
 
-        await update.message.reply_text("⚡ Generating 3-GW Horizon Optimized Free Hit squad...")
+        await update.message.reply_text("⚡ Generating optimal Free Hit squad for the upcoming gameweek...")
         data = await self._fetch_bootstrap_static()
         fixtures = await self._fetch_fixtures()
         if not data or not fixtures:
@@ -475,11 +537,14 @@ class FPLBot:
         else:
             dynamic_budget = 100.0  # Fallback
 
+        # Free Hit only lasts a single gameweek, so score purely on the upcoming GW —
+        # a multi-week horizon would reward players whose good fixtures happen AFTER
+        # the hit has already reverted.
         candidates = []
         for p in data['elements']:
-            if not self._is_available(p):
+            if self._is_hard_excluded(p):
                 continue
-            score = self._calculate_horizon_xpts(p, fixtures, target_gw, horizon=3)
+            score = self._calculate_single_gw_xpts(p, fixtures, target_gw)
             candidates.append({
                 'id': p['id'],
                 'name': p['web_name'],
@@ -499,12 +564,12 @@ class FPLBot:
         captain = next((p for p in starters if p.get('is_captain')), None)
 
         report = [
-            f"⚡ **Free Hit Horizon Squad (GW {target_gw}-{target_gw+2})**",
+            f"⚡ **Free Hit Squad (GW {target_gw})**",
             f"💰 **Cost:** £{total_cost:.1f}m / £{dynamic_budget:.1f}m limit\n",
             "🛡️ **Starting XI:**",
         ]
         for p in sorted(starters, key=lambda x: x['element_type']):
-            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m) — 3-GW xP: {p['score']:.1f}")
+            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m) — xP: {p['score']:.1f}")
 
         report.append("\n🪑 **Bench:**")
         for p in bench:
@@ -538,6 +603,10 @@ class FPLBot:
             return
 
         target_gw, pick_gw = self._get_target_and_pick_gw(data)
+
+        history_data = await self._fetch_manager_history(team_id)
+        free_transfers = self._estimate_free_transfers(history_data, pick_gw)
+
         pools = await self._build_transfer_pools(team_id, pick_gw, target_gw, fixtures, data)
         if not pools:
             await update.message.reply_text(f"❌ Could not retrieve your squad for GW {pick_gw}.")
@@ -558,7 +627,7 @@ class FPLBot:
             await update.message.reply_text("✅ Squad is well-optimized — no beneficial transfer found within your requested limit.")
             return
 
-        hit_cost = max(0, transfers_used - 1) * 4  # assumes 1 free transfer banked
+        hit_cost = max(0, transfers_used - free_transfers) * 4
         net_gain = gain - hit_cost
         remaining_bank = pools['dynamic_budget'] - sum(p['cost'] for p in result['final_squad'])
 
@@ -570,18 +639,18 @@ class FPLBot:
         for p in sorted(result['in'], key=lambda x: x['element_type']):
             report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m) — xP: {p['score']:.1f}")
 
-        report.append(f"\n📊 **Transfers used:** {transfers_used}")
+        report.append(f"\n📊 **Transfers used:** {transfers_used} ({free_transfers} free transfer(s) banked)")
         report.append(f"📈 **Gross projected gain:** +{gain:.1f} xP")
         report.append(f"💰 **Bank after:** £{remaining_bank:.1f}m")
-        if transfers_used > 1:
-            report.append(f"⚠️ **Assumed hit cost:** -{hit_cost:.0f} pts (assumes 1 free transfer banked)")
+        if transfers_used > free_transfers:
+            report.append(f"⚠️ **Hit cost:** -{hit_cost:.0f} pts ({transfers_used - free_transfers} paid transfer(s))")
             report.append(f"📉 **Net gain after hits:** +{net_gain:.1f} xP")
-            report.append("\nℹ️ _If you have more than 1 free transfer, use `/hits` to weigh whether the extra moves are worth any remaining hit cost._")
+            report.append("\nℹ️ _Use `/hits` to weigh whether the extra moves are worth it over a longer horizon._")
 
         await update.message.reply_text("\n".join(report), parse_mode="Markdown")
 
-    async def _send_transfer_plan_report(self, update, target_gw, label, result, transfers_used, gain, hit_cost, net_gain):
-        report = [f"💡 **{label} — {transfers_used} transfer(s) (GW {target_gw}-{target_gw+2})**\n", "🔴 **OUT:**"]
+    async def _send_transfer_plan_report(self, update, target_gw, horizon, free_transfers, label, result, transfers_used, gain, hit_cost, net_gain):
+        report = [f"💡 **{label} — {transfers_used} transfer(s) (GW {target_gw}-{target_gw + horizon - 1})**\n", "🔴 **OUT:**"]
         for p in sorted(result['out'], key=lambda x: x['element_type']):
             report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m) — xP: {p['score']:.1f}")
 
@@ -590,10 +659,10 @@ class FPLBot:
             report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m) — xP: {p['score']:.1f}")
 
         report.append(f"\n📈 **Gross gain:** +{gain:.1f} xP")
-        if transfers_used > 1:
-            report.append(f"⚠️ **Hit cost:** -{hit_cost:.0f} pts")
+        report.append(f"🎟️ **Free transfers banked:** {free_transfers}")
+        if transfers_used > free_transfers:
+            report.append(f"⚠️ **Hit cost:** -{hit_cost:.0f} pts ({transfers_used - free_transfers} paid transfer(s))")
             report.append(f"📉 **Net gain:** +{net_gain:.1f} xP")
-        report.append("\nℹ️ _Assumes 1 free transfer banked — adjust manually if you have more or fewer._")
         await update.message.reply_text("\n".join(report), parse_mode="Markdown")
 
     async def hits(self, update: Update, context):
@@ -620,19 +689,25 @@ class FPLBot:
             return
 
         target_gw, pick_gw = self._get_target_and_pick_gw(data)
-        pools = await self._build_transfer_pools(team_id, pick_gw, target_gw, fixtures, data)
+
+        history_data = await self._fetch_manager_history(team_id)
+        free_transfers = self._estimate_free_transfers(history_data, pick_gw)
+
+        # /hits weighs a -4 hit that persists beyond just the coming GW, so it looks
+        # further out than /transfers: the coming gameweek plus the next 3 (4 GWs total).
+        HORIZON = 4
+        pools = await self._build_transfer_pools(team_id, pick_gw, target_gw, fixtures, data, horizon=HORIZON)
         if not pools:
             await update.message.reply_text(f"❌ Could not retrieve your squad for GW {pick_gw}.")
             return
 
-        # Thresholds: a free transfer just needs to clear model noise; every additional
-        # paid hit must independently justify itself with a real margin, since its cost
-        # (-4) is guaranteed while its gain is only an expectation.
+        # Thresholds: transfers within your banked free count just need to clear model
+        # noise; every transfer beyond that must independently justify itself with a real
+        # margin, since its cost (-4) is guaranteed while its gain is only an expectation.
         FREE_THRESHOLD = 1.0
         HIT_BUFFER = 2.0
-        caveat = ("\n\nℹ️ _Note: assumes 1 free transfer banked. If you already have more "
-                  "than 1 saved, some of this \"hit\" cost may not actually apply — check "
-                  "your FPL app's transfer count._")
+        caveat = (f"\n\nℹ️ _Free transfers banked is estimated at {free_transfers} from your transfer "
+                  f"history — if a recent chip wasn't detected correctly, check your FPL app's transfer count._")
 
         if forced_n:
             result = await self._solve_transfers(pools['owned_pool'], pools['candidates_pool'], forced_n, pools['dynamic_budget'])
@@ -641,9 +716,9 @@ class FPLBot:
                 return
             transfers_used = len(result['out'])
             gain = sum(p['score'] for p in result['in']) - sum(p['score'] for p in result['out'])
-            hit_cost = max(0, transfers_used - 1) * 4
+            hit_cost = max(0, transfers_used - free_transfers) * 4
             net_gain = gain - hit_cost
-            threshold = FREE_THRESHOLD if transfers_used <= 1 else HIT_BUFFER
+            threshold = FREE_THRESHOLD if transfers_used <= free_transfers else HIT_BUFFER
 
             if net_gain <= threshold:
                 await update.message.reply_text(
@@ -653,7 +728,7 @@ class FPLBot:
                 )
                 return
 
-            await self._send_transfer_plan_report(update, target_gw, "Recommended Hit Plan", result, transfers_used, gain, hit_cost, net_gain)
+            await self._send_transfer_plan_report(update, target_gw, HORIZON, free_transfers, "Recommended Hit Plan", result, transfers_used, gain, hit_cost, net_gain)
             return
 
         # No count specified: explore 1–4 transfers and build a staircase of accepted upgrades,
@@ -665,7 +740,7 @@ class FPLBot:
                 continue
             transfers_used = len(result['out'])
             gain = sum(p['score'] for p in result['in']) - sum(p['score'] for p in result['out'])
-            hit_cost = max(0, transfers_used - 1) * 4
+            hit_cost = max(0, transfers_used - free_transfers) * 4
             net_gain = gain - hit_cost
             scenarios[transfers_used] = {
                 "transfers_used": transfers_used, "gain": gain,
@@ -674,7 +749,7 @@ class FPLBot:
 
         best_key = 0
         for k in sorted(k for k in scenarios if k > 0):
-            threshold = FREE_THRESHOLD if k == 1 else HIT_BUFFER
+            threshold = FREE_THRESHOLD if k <= free_transfers else HIT_BUFFER
             if scenarios[k]['net_gain'] > scenarios[best_key]['net_gain'] + threshold:
                 best_key = k
 
@@ -684,10 +759,263 @@ class FPLBot:
 
         best = scenarios[best_key]
         await self._send_transfer_plan_report(
-            update, target_gw, "Recommended Hit Plan", best['result'],
+            update, target_gw, HORIZON, free_transfers, "Recommended Hit Plan", best['result'],
             best['transfers_used'], best['gain'], best['hit_cost'], best['net_gain']
         )
         await update.message.reply_text(caveat, parse_mode="Markdown")
+
+    async def wildcard(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = self.db.get_team_id(chat_id)
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+
+        WILDCARD_HORIZON = 6
+        await update.message.reply_text(f"🃏 Generating long-horizon Wildcard squad ({WILDCARD_HORIZON}-GW view)...")
+
+        data = await self._fetch_bootstrap_static()
+        fixtures = await self._fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+
+        picks_data = await self._fetch_manager_gw_picks(team_id, pick_gw)
+        if picks_data and 'entry_history' in picks_data:
+            squad_value = picks_data['entry_history'].get('value', 1000) / 10.0
+            bank = picks_data['entry_history'].get('bank', 0) / 10.0
+            dynamic_budget = squad_value + bank
+        else:
+            dynamic_budget = 100.0
+
+        # Unlike Free Hit, a Wildcard squad has to hold up over many weeks, so score it
+        # with the same long-horizon engine used for /hits rather than a single GW.
+        candidates = []
+        for p in data['elements']:
+            if self._is_hard_excluded(p):
+                continue
+            score = self._calculate_horizon_xpts(p, fixtures, target_gw, horizon=WILDCARD_HORIZON)
+            candidates.append({
+                'id': p['id'],
+                'name': p['web_name'],
+                'element_type': p['element_type'],
+                'cost': p['now_cost'] / 10.0,
+                'team': p['team'],
+                'score': score,
+            })
+
+        squad15 = await self._solve_best_15(candidates, budget=dynamic_budget)
+        if not squad15:
+            await update.message.reply_text("❌ Couldn't build a valid Wildcard squad.")
+            return
+
+        starters, bench = await self._solve_best_xi(squad15)
+        total_cost = sum(p['cost'] for p in squad15)
+        captain = next((p for p in starters if p.get('is_captain')), None)
+
+        report = [
+            f"🃏 **Wildcard Squad (GW {target_gw}-{target_gw + WILDCARD_HORIZON - 1})**",
+            f"💰 **Cost:** £{total_cost:.1f}m / £{dynamic_budget:.1f}m limit\n",
+            "🛡️ **Starting XI:**",
+        ]
+        for p in sorted(starters, key=lambda x: x['element_type']):
+            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m) — {WILDCARD_HORIZON}-GW xP: {p['score']:.1f}")
+
+        report.append("\n🪑 **Bench:**")
+        for p in bench:
+            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m)")
+
+        if captain:
+            report.append(f"\n⭐ **Captain:** {captain['name']}")
+        report.append(f"\nℹ️ _Scored over the next {WILDCARD_HORIZON} gameweeks since a Wildcard is a permanent rebuild, not a one-week hit._")
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def bench_boost(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = self.db.get_team_id(chat_id)
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+
+        await update.message.reply_text("🚀 Checking bench strength across upcoming gameweeks...")
+
+        data = await self._fetch_bootstrap_static()
+        fixtures = await self._fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+        picks_data = await self._fetch_manager_gw_picks(team_id, pick_gw)
+        if not picks_data or 'picks' not in picks_data:
+            await update.message.reply_text(f"❌ Could not retrieve your squad for GW {pick_gw}.")
+            return
+
+        players_dict = {p['id']: p for p in data['elements']}
+
+        # Bench Boost only pays off if your bench actually scores — check the next few
+        # weeks rather than just this one, since a good bench week might not be now.
+        BB_LOOKAHEAD = 4
+        BB_THRESHOLD = 12.0
+        week_results = []
+        for offset in range(BB_LOOKAHEAD):
+            gw = target_gw + offset
+            pool = []
+            for pick in picks_data['picks']:
+                p_info = players_dict.get(pick['element'])
+                if not p_info:
+                    continue
+                score = self._calculate_single_gw_xpts(p_info, fixtures, gw, apply_doubt_penalty=(offset == 0))
+                pool.append({
+                    'id': p_info['id'], 'name': p_info['web_name'], 'element_type': p_info['element_type'],
+                    'now_cost': p_info['now_cost'] / 10.0, 'available': self._is_available(p_info), 'score': score,
+                })
+            starters, bench = await self._solve_best_xi(pool)
+            if not starters:
+                continue
+            bench_score = sum(p['score'] for p in bench)
+            week_results.append({'gw': gw, 'bench_score': bench_score, 'bench': bench})
+
+        if not week_results:
+            await update.message.reply_text("❌ Couldn't evaluate your bench.")
+            return
+
+        best = max(week_results, key=lambda w: w['bench_score'])
+
+        report = [f"🚀 **Bench Boost Check (GW {target_gw}-{target_gw + BB_LOOKAHEAD - 1})**\n"]
+        for w in week_results:
+            marker = " ⭐" if w['gw'] == best['gw'] else ""
+            report.append(f"• GW{w['gw']}: bench xP {w['bench_score']:.1f}{marker}")
+
+        report.append("")
+        if best['bench_score'] >= BB_THRESHOLD:
+            report.append(f"✅ **GW{best['gw']}** looks like your best Bench Boost week (bench xP {best['bench_score']:.1f}).")
+        else:
+            report.append(
+                f"⚠️ Your bench doesn't clear a strong Bench Boost bar in the next {BB_LOOKAHEAD} GWs "
+                f"(best is GW{best['gw']} at {best['bench_score']:.1f} xP) — consider strengthening bench depth first."
+            )
+
+        report.append(f"\n🪑 **Bench for GW{best['gw']}:**")
+        for p in sorted(best['bench'], key=lambda x: x['element_type']):
+            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} — xP: {p['score']:.1f}")
+
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def triple_captain(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = self.db.get_team_id(chat_id)
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+
+        await update.message.reply_text("👑 Scanning captaincy ceiling across upcoming gameweeks...")
+
+        data = await self._fetch_bootstrap_static()
+        fixtures = await self._fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+        picks_data = await self._fetch_manager_gw_picks(team_id, pick_gw)
+        if not picks_data or 'picks' not in picks_data:
+            await update.message.reply_text(f"❌ Could not retrieve your squad for GW {pick_gw}.")
+            return
+
+        players_dict = {p['id']: p for p in data['elements']}
+
+        # Triple Captain wants a single explosive week for your best player, not an
+        # averaged one — scan single-GW scores rather than the horizon-discounted engine.
+        TC_LOOKAHEAD = 4
+        week_best = []
+        for offset in range(TC_LOOKAHEAD):
+            gw = target_gw + offset
+            best_player, best_score = None, float('-inf')
+            for pick in picks_data['picks']:
+                p_info = players_dict.get(pick['element'])
+                if not p_info:
+                    continue
+                score = self._calculate_single_gw_xpts(p_info, fixtures, gw, apply_doubt_penalty=(offset == 0))
+                if score > best_score:
+                    best_score, best_player = score, p_info
+            if best_player:
+                week_best.append({'gw': gw, 'name': best_player['web_name'], 'element_type': best_player['element_type'], 'score': best_score})
+
+        if not week_best:
+            await update.message.reply_text("❌ Couldn't evaluate captaincy options.")
+            return
+
+        top = max(week_best, key=lambda w: w['score'])
+
+        report = [f"👑 **Triple Captain Scan (GW {target_gw}-{target_gw + TC_LOOKAHEAD - 1})**\n"]
+        for w in week_best:
+            marker = " ⭐" if w['gw'] == top['gw'] else ""
+            report.append(f"• GW{w['gw']}: {w['name']} ({POS_NAME[w['element_type']]}) — xP: {w['score']:.1f}{marker}")
+
+        report.append(
+            f"\n✅ **Best week to play Triple Captain: GW{top['gw']}** on {top['name']} — "
+            f"the extra multiplier is worth roughly +{top['score']:.1f} xP on top of a normal captaincy."
+        )
+        report.append("\nℹ️ _This only weighs your current squad — a transfer or a newly confirmed double gameweek could change the picture closer to the week._")
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def differentials(self, update: Update, context):
+        max_own = 10.0
+        pos_filter = None
+        pos_map = {'GKP': 1, 'DEF': 2, 'MID': 3, 'FWD': 4}
+        if context.args:
+            for arg in context.args:
+                if arg.upper() in pos_map:
+                    pos_filter = pos_map[arg.upper()]
+                    continue
+                try:
+                    max_own = float(arg)
+                except ValueError:
+                    pass
+
+        await update.message.reply_text(f"🔍 Scanning for differentials under {max_own:.0f}% ownership...")
+
+        data = await self._fetch_bootstrap_static()
+        fixtures = await self._fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+
+        candidates = []
+        for p in data['elements']:
+            if self._is_hard_excluded(p):
+                continue
+            if pos_filter and p['element_type'] != pos_filter:
+                continue
+            try:
+                owned_pct = float(p.get('selected_by_percent', '0') or 0)
+            except (TypeError, ValueError):
+                owned_pct = 0.0
+            if owned_pct > max_own:
+                continue
+            score = self._calculate_single_gw_xpts(p, fixtures, target_gw)
+            if score <= 0:
+                continue
+            candidates.append({
+                'id': p['id'], 'name': p['web_name'], 'element_type': p['element_type'],
+                'cost': p['now_cost'] / 10.0, 'owned_pct': owned_pct, 'score': score,
+            })
+
+        if not candidates:
+            await update.message.reply_text("❌ No differentials found matching those filters.")
+            return
+
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+        report = [f"🔍 **Top Differentials (GW {target_gw}, <{max_own:.0f}% owned)**\n"]
+        for p in candidates[:10]:
+            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m, {p['owned_pct']:.1f}% owned) — xP: {p['score']:.1f}")
+
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
 
 
 def start_telegram_bot():
@@ -705,6 +1033,10 @@ def start_telegram_bot():
     application.add_handler(CommandHandler("freehit", bot_instance.free_hit))
     application.add_handler(CommandHandler("transfers", bot_instance.transfers))
     application.add_handler(CommandHandler("hits", bot_instance.hits))
+    application.add_handler(CommandHandler("wildcard", bot_instance.wildcard))
+    application.add_handler(CommandHandler("bboost", bot_instance.bench_boost))
+    application.add_handler(CommandHandler("triplecap", bot_instance.triple_captain))
+    application.add_handler(CommandHandler("differentials", bot_instance.differentials))
 
     logger.info("Starting FPL Telegram Bot via Polling...")
     application.run_polling()
