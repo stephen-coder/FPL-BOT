@@ -97,7 +97,6 @@ class FPLBot:
         return status == 'a' and chance >= 75
 
     def _get_single_gw_score(self, player, fixtures, target_gw):
-        """Calculates expected score for just the immediate target gameweek (for /squad)."""
         team_id = player['team']
         base_ep = float(player.get('ep_next', 0) or 0)
         form = float(player.get('form', 0) or 0)
@@ -120,7 +119,6 @@ class FPLBot:
         return total_gw_score
 
     def _get_3gw_score(self, player, fixtures, start_gw):
-        """Calculates cumulative expected score over a 3-gameweek horizon (for /transfers & /hits)."""
         team_id = player['team']
         base_ep = float(player.get('ep_next', 0) or 0)
         form = float(player.get('form', 0) or 0)
@@ -268,7 +266,6 @@ class FPLBot:
             p_info = players_dict.get(pick['element'])
             if not p_info:
                 continue
-            # Uses single-week scoring for immediate starting XI selection
             score = self._get_single_gw_score(p_info, fixtures, target_gw)
             available = self._is_available(p_info)
             pool.append({
@@ -470,118 +467,6 @@ class FPLBot:
             if p['id'] not in owned_ids and p['element_type'] == weakest['element_type']
             and self._is_available(p) and (p['now_cost'] / 10.0) <= max_budget
         ]
-
         if not candidates:
-            await update.message.reply_text(f"⚠️ No affordable upgrades found for your weakest player ({weakest['name']}).")
-            return
-
-        best = max(candidates, key=lambda p: self._get_3gw_score(p, fixtures, target_gw))
-        best_score = self._get_3gw_score(best, fixtures, target_gw)
-        gain = best_score - weakest['score']
-        net_gain = gain - 4.0
-
-        if net_gain <= 0:
-            await update.message.reply_text(
-                f"❌ **Hit Not Recommended (3-GW Horizon)**\n\n"
-                f"Replacing **{weakest['name']}** (3-GW xP: {weakest['score']:.1f}) with **{best['web_name']}** "
-                f"(3-GW xP: {best_score:.1f}) gives a 3-week gain of +{gain:.1f} xP. "
-                f"After accounting for the 4-point deduction, it yields a net gain of {net_gain:.1f} pts. Not worth a hit."
-            )
-            return
-
-        remaining_bank = max_budget - (best['now_cost'] / 10.0)
-        report = [
-            f"💡 **Hit Recommendation (3-GW Horizon)**\n",
-            f"🔴 **OUT:** [{POS_NAME[weakest['element_type']]}] {weakest['name']} (£{weakest['cost']}m)",
-            f"🟢 **IN:** [{POS_NAME[best['element_type']]}] {best['web_name']} (£{best['now_cost']/10.0}m)",
-            f"📈 **3-Week Gross Gain:** +{gain:.1f} xP",
-            f"⚖️ **Net Gain (Minus 4-pt Hit):** +{net_gain:.1f} xP",
-            f"💰 **Bank After:** £{remaining_bank:.1f}m",
-            f"\n✅ *Verdict:* Mathematically justified! The incoming player covers the hit and yields profit over 3 weeks."
-        ]
-        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
-
-    async def live(self, update: Update, context):
-        chat_id = update.effective_chat.id
-        team_id = self.user_data_store.get(chat_id)
-        if not team_id:
-            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
-            return
-
-        data = self.fetch_bootstrap_static()
-        if not data:
-            await update.message.reply_text("❌ FPL API unreachable.")
-            return
-
-        current_gw = next((gw['id'] for gw in data['events'] if gw.get('is_current')), None)
-        if not current_gw:
-            next_gw = next((gw['id'] for gw in data['events'] if gw.get('is_next')), 1)
-            current_gw = max(1, next_gw - 1)
-
-        picks_data = self.fetch_manager_gw_picks(team_id, current_gw)
-        if not picks_data or 'picks' not in picks_data:
-            await update.message.reply_text(f"❌ Could not retrieve live picks for GW {current_gw}.")
-            return
-
-        live_data = self.fetch_live_gwdata(current_gw)
-        live_elements = {item['id']: item['stats'] for item in live_data['elements']} if live_data else {}
-        players_dict = {p['id']: p for p in data['elements']}
-
-        total_points = 0
-        report = [f"🔴 **Live Tracker (Gameweek {current_gw})**\n", "🛡️ **Starting XI:**"]
-
-        for pick in picks_data['picks'][:11]:
-            pid = pick['element']
-            p_info = players_dict.get(pid, {})
-            name = p_info.get('web_name', 'Unknown')
-            multiplier = pick.get('multiplier', 1)
-            
-            stats = live_elements.get(pid, {})
-            pts = stats.get('total_points', 0)
-            total_points += (pts * multiplier)
-            
-            mult_str = f" ((C))" if multiplier == 2 else (" (VC)" if multiplier == 0 and pick.get('is_vice') else "")
-            report.append(f"• {name}: **{pts} pts**{mult_str}")
-
-        report.append(f"\n📊 **Total GW Points (Estimated):** {total_points}")
-        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
-
-fpl_bot = FPLBot()
-app_flask = Flask(__name__)
-
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "fpl_secret_token")
-
-ptb_application = Application.builder().token(TELEGRAM_BOT_TOKEN).updater(None).build()
-
-ptb_application.add_handler(CommandHandler("start", fpl_bot.start))
-ptb_application.add_handler(CommandHandler("setteam", fpl_bot.set_team))
-ptb_application.add_handler(CommandHandler("squad", fpl_bot.squad))
-ptb_application.add_handler(CommandHandler("freehit", fpl_bot.free_hit))
-ptb_application.add_handler(CommandHandler("transfers", fpl_bot.transfers))
-ptb_application.add_handler(CommandHandler("hits", fpl_bot.hits))
-ptb_application.add_handler(CommandHandler("live", fpl_bot.live))
-
-@app_flask.before_first_request
-async def setup_webhook():
-    webhook_url = f"{os.environ.get('RENDER_EXTERNAL_URL')}/{TELEGRAM_WEBHOOK_SECRET}"
-    await ptb_application.bot.set_webhook(url=webhook_url)
-
-@app_flask.route(f"/{TELEGRAM_WEBHOOK_SECRET}", methods=["POST"])
-def webhook():
-    update_json = request.get_json(force=True)
-    update = Update.de_json(update_json, ptb_application.bot)
-    
-    async def process():
-        async with ptb_application:
-            await ptb_application.process_update(update)
-
-    asyncio.run(process())
-    return Response("OK", status=200)
-
-@app_flask.route("/", methods=["GET"])
-def index():
-    return "FPL Bot is running live via webhooks!", 200
-
-if __name__ == "__main__":
-    app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+            await update.message.reply_text(f"✅ Your lowest 3-GW rated player ({weakest['name']}) has no affordable upgrade for a hit analysis.")
+        
