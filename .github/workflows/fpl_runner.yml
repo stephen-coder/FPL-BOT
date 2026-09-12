@@ -106,25 +106,21 @@ class FPLBot:
         available = self._is_available(player)
 
         if not available:
-            return -50.0  - (3 * 20) # Heavy penalty across horizon if injured/suspended
+            return -50.0 - (3 * 20)
 
         total_score = 0.0
-        # Look ahead 3 gameweeks: start_gw, start_gw + 1, start_gw + 2
         for gw_offset in range(3):
             gw = start_gw + gw_offset
-            # Find fixtures for this team in this gameweek
             gw_fixtures = [f for f in fixtures if f['event'] == gw and (f['team_h'] == team_id or f['team_a'] == team_id)]
             
             if not gw_fixtures:
-                # Blank Gameweek (no fixture)
                 continue
             
             for f in gw_fixtures:
                 is_home = (f['team_h'] == team_id)
                 fdr = f['team_h_difficulty'] if is_home else f['team_a_difficulty']
-                # Evaluate single GW score based on baseline EP, form, and fixture difficulty
                 gw_score = (base_ep * 2.0) + (form * 0.5) - (fdr * 0.8)
-                total_score += max(gw_score, 0.5) # Minimum floor for playing players
+                total_score += max(gw_score, 0.5)
 
         return total_score
 
@@ -390,7 +386,7 @@ class FPLBot:
         best_score = self._get_3gw_score(best, fixtures, target_gw)
         gain = best_score - weakest['score']
 
-        if gain <= 1.5: # Minimum threshold over 3 weeks
+        if gain <= 1.5:
             await update.message.reply_text(f"✅ Squad looks well-balanced for the next 3 weeks — no transfer clears the gain threshold.")
             return
 
@@ -459,7 +455,7 @@ class FPLBot:
         best = max(candidates, key=lambda p: self._get_3gw_score(p, fixtures, target_gw))
         best_score = self._get_3gw_score(best, fixtures, target_gw)
         gain = best_score - weakest['score']
-        net_gain = gain - 4.0 # Subtracting the 4-point hit cost
+        net_gain = gain - 4.0
 
         if net_gain <= 0:
             await update.message.reply_text(
