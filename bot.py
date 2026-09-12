@@ -97,7 +97,6 @@ class FPLBot:
         return status == 'a' and chance >= 75
 
     def _get_single_gw_score(self, player, fixtures, target_gw):
-        """Calculates expected score for just the immediate target gameweek (for /squad)."""
         team_id = player['team']
         base_ep = float(player.get('ep_next', 0) or 0)
         form = float(player.get('form', 0) or 0)
@@ -120,7 +119,6 @@ class FPLBot:
         return total_gw_score
 
     def _get_3gw_score(self, player, fixtures, start_gw):
-        """Calculates cumulative expected score over a 3-gameweek horizon (for /transfers & /hits)."""
         team_id = player['team']
         base_ep = float(player.get('ep_next', 0) or 0)
         form = float(player.get('form', 0) or 0)
@@ -268,7 +266,6 @@ class FPLBot:
             p_info = players_dict.get(pick['element'])
             if not p_info:
                 continue
-            # Uses single-week scoring for immediate starting XI selection
             score = self._get_single_gw_score(p_info, fixtures, target_gw)
             available = self._is_available(p_info)
             pool.append({
@@ -468,3 +465,8 @@ class FPLBot:
         candidates = [
             p for p in data['elements']
             if p['id'] not in owned_ids and p['element_type'] == weakest['element_type']
+            and self._is_available(p) and (p['now_cost'] / 10.0) <= max_budget
+        ]
+        if not candidates:
+            await update.message.reply_text(f"✅ Your lowest 3-GW rated player ({weakest['name']}) has no affordable upgrade for a hit analysis.")
+        
