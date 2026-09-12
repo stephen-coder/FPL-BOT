@@ -15,6 +15,32 @@ logger = logging.getLogger(__name__)
 
 # --- Flask Server Setup for Render Health Checks ---
 app = Flask(__name__)
+def start_telegram_bot():
+    BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN environment variable is missing!")
+        return
+
+    bot_instance = FPLBot()
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", bot_instance.start))
+    application.add_handler(CommandHandler("setteam", bot_instance.set_team))
+    application.add_handler(CommandHandler("squad", bot_instance.squad))
+    application.add_handler(CommandHandler("freehit", bot_instance.free_hit))
+    application.add_handler(CommandHandler("transfers", bot_instance.transfers))
+    application.add_handler(CommandHandler("hits", bot_instance.hits))
+
+    logger.info("Starting FPL Telegram Bot via Polling...")
+    application.run_polling()
+
+if __name__ == "__main__":
+    # Local testing fallback
+    web_thread = Thread(target=run_web)
+    web_thread.daemon = True
+    web_thread.start()
+    start_telegram_bot()
+
 
 @app.route('/')
 def health_check():
