@@ -1,9 +1,11 @@
 import os
-import requests
 import logging
+import asyncio
 import pulp
+import requests
+from flask import Flask, request, Response
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -20,13 +22,11 @@ HEADERS = {
 
 POS_NAME = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
 
-
 class FPLBot:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
-
-    # ------------- API fetchers -------------
+        self.user_data_store = {}  # In-memory storage for user FPL IDs
 
     def fetch_bootstrap_static(self):
         try:
@@ -73,8 +73,6 @@ class FPLBot:
             logger.error(f"Error fetching live data for GW {gw}: {e}")
             return None
 
-    # ------------- Gameweek helpers -------------
-
     def _get_target_and_pick_gw(self, data):
         events = data['events']
         next_gw = next((gw['id'] for gw in events if gw.get('is_next')), None)
@@ -99,7 +97,6 @@ class FPLBot:
         return status == 'a' and chance >= 75
 
     def _get_3gw_score(self, player, fixtures, start_gw):
-        """Calculates cumulative expected score over a 3-gameweek window."""
         team_id = player['team']
         base_ep = float(player.get('ep_next', 0) or 0)
         form = float(player.get('form', 0) or 0)
@@ -123,8 +120,6 @@ class FPLBot:
                 total_score += max(gw_score, 0.5)
 
         return total_score
-
-    # ------------- Optimization -------------
 
     def _solve_best_xi(self, pool):
         if len(pool) < 11:
@@ -187,9 +182,8 @@ class FPLBot:
             return []
         return [p for p in candidates if pulp.value(pick[p['id']]) == 1]
 
-    # ------------- Commands -------------
-
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Telegram Handlers
+    async def start(self, update: Update, context):
         welcome_text = (
             "⚽ **Welcome to the Upgraded 3-GW Horizon FPL Bot!**\n\n"
             "**Core Commands:**\n"
@@ -202,7 +196,8 @@ class FPLBot:
         )
         await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
-    async def set_team(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def set_team(self, update: Update, context):
+        chat_id = update.effective_chat.id
         if not context.args:
             await update.message.reply_text("⚠️ Please provide your FPL Team ID. Example: `/setteam 1234567`", parse_mode="Markdown")
             return
@@ -212,7 +207,7 @@ class FPLBot:
             await update.message.reply_text("❌ Invalid Team ID format. It should be a number.")
             return
 
-        context.user_data['team_id'] = team_id
+        self.user_data_store[chat_id] = team_id
         manager = self.fetch_manager_data(team_id)
         if manager:
             name = f"{manager.get('player_first_name', '')} {manager.get('player_last_name', '')}"
@@ -221,8 +216,9 @@ class FPLBot:
         else:
             await update.message.reply_text("⚠️ Team ID saved, but could not verify details from FPL API.")
 
-    async def squad(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        team_id = context.user_data.get('team_id')
+    async def squad(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = self.user_data_store.get(chat_id)
         if not team_id:
             await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
             return
@@ -282,7 +278,7 @@ class FPLBot:
         report.append(f"🥈 **Vice-Captain:** {vice['name']}")
         await update.message.reply_text("\n".join(report), parse_mode="Markdown")
 
-    async def free_hit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def free_hit(self, update: Update, context):
         await update.message.reply_text("⚡ Generating 3-GW Optimized Free Hit squad...")
         data = self.fetch_bootstrap_static()
         fixtures = self.fetch_fixtures()
@@ -331,8 +327,9 @@ class FPLBot:
             report.append(f"\n⭐ **Captain:** {captain['name']}")
         await update.message.reply_text("\n".join(report), parse_mode="Markdown")
 
-    async def transfers(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        team_id = context.user_data.get('team_id')
+    async def transfers(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = self.user_data_store.get(chat_id)
         if not team_id:
             await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
             return
@@ -400,8 +397,9 @@ class FPLBot:
         ]
         await update.message.reply_text("\n".join(report), parse_mode="Markdown")
 
-    async def hits(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        team_id = context.user_data.get('team_id')
+    async def hits(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = self.user_data_store.get(chat_id)
         if not team_id:
             await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
             return
@@ -478,8 +476,9 @@ class FPLBot:
         ]
         await update.message.reply_text("\n".join(report), parse_mode="Markdown")
 
-    async def live_tracker(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        team_id = context.user_data.get('team_id')
+    async def live_tracker(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = self.user_data_store.get(chat_id)
         if not team_id:
             await update.message.reply_text("⚠️ Please link your team first using `/setteam <ID>`", parse_mode="Markdown")
             return
@@ -522,19 +521,70 @@ class FPLBot:
         await update.message.reply_text("\n".join(report), parse_mode="Markdown")
 
 
+# --- Flask & Webhook Integration Setup ---
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL") # Render automatically sets this env variable!
+PORT = int(os.getenv("PORT", 10000))
+
+app = Flask(__name__)
+fpl_bot = FptBotInstance = FPLBot()
+
+# Build Telegram Application
+ptb_app = Application.builder().token(TOKEN).updater(None).build()
+
+# Register handlers
+ptb_app.add_handler(CommandHandler("start", fpl_bot.start))
+ptb_app.add_handler(CommandHandler("setteam", fpl_bot.set_team))
+ptb_app.add_handler(CommandHandler("squad", fpl_bot.squad))
+ptb_app.add_handler(CommandHandler("freehit", fpl_bot.free_hit))
+ptb_app.add_handler(CommandHandler("transfers", fpl_bot.transfers))
+ptb_app.add_handler(CommandHandler("hits", fpl_bot.hits))
+ptb_app.add_handler(CommandHandler("live", fpl_bot.live_tracker))
+
+
+@app.route("/", methods=["GET"])
+def index():
+    return "FPL Bot Webhook Server is active!", 200
+
+
+@app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+    """Endpoint that receives updates from Telegram via Webhook"""
+    if request.headers.get("content-type") == "application/json":
+        json_string = request.get_data().decode("utf-8")
+        update = Update.de_json(json_string, ptb_app.bot)
+        
+        # Run the async update processing inside a synchronous Flask route safely
+        async def process():
+            async with ptb_app:
+                await ptb_app.process_update(update)
+
+        asyncio.run(process())
+        return "OK", 200
+    else:
+        return "Invalid content-type", 403
+
+
+async def setup_webhook():
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{TOKEN}"
+        await ptb_app.bot.set_webhook(url=webhook_url)
+        logger.info(f"Webhook successfully set to: {webhook_url}")
+    else:
+      logger.warning("RENDER_EXTERNAL_URL environment variable not found. Webhook auto-registration skipped.")
+
+
 if __name__ == "__main__":
-    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+    # Initialize PTB and set webhook automatically upon starting
+    async def main():
+        async with ptb_app:
+            await ptb_app.initialize()
+            if RENDER_EXTERNAL_URL:
+                await ptb_app.bot.set_webhook(url=f"{RENDER_EXTERNAL_URL.rstrip('/')}/{TOKEN}")
+            await ptb_app.start()
+
+    # Run initialization before starting flask
+    asyncio.run(setup_webhook())
     
-    bot_instance = FPLBot()
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", bot_instance.start))
-    app.add_handler(CommandHandler("setteam", bot_instance.set_team))
-    app.add_handler(CommandHandler("squad", bot_instance.squad))
-    app.add_handler(CommandHandler("freehit", bot_instance.free_hit))
-    app.add_handler(CommandHandler("transfers", bot_instance.transfers))
-    app.add_handler(CommandHandler("hits", bot_instance.hits))
-    app.add_handler(CommandHandler("live", bot_instance.live_tracker))
-
-    print("🤖 Upgraded 3-GW Horizon FPL Bot is running...")
-    app.run_polling()
+    # Start Flask Web Server for Render
+    app.run(host="0.0.0.0", port=PORT)
