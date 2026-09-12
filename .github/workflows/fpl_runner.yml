@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+from threading import Thread
 import pulp
 import requests
 from flask import Flask, request, Response
@@ -11,6 +12,18 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# --- Flask Server Setup for Render Health Checks ---
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return "FPL Bot is active and healthy!", 200
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+# --------------------------------------------------
 
 FPL_BASE_URL = "https://fantasy.premierleague.com/api/"
 HEADERS = {
@@ -26,7 +39,7 @@ class FPLBot:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
-        self.user_data_store = {}  # In-memory storage for user FPL IDs
+        self.user_data_store = {}
 
     def fetch_bootstrap_static(self):
         try:
@@ -213,7 +226,6 @@ class FPLBot:
             "• `/squad` - Optimal starting XI for the immediate GW\n"
             "• `/freehit` - Generate optimal Free Hit squad (3-GW Horizon)\n"
             "• `/transfers` - 3-GW Horizon transfer suggestion\n"
-            "• `/live` - Live score & point tracker for current GW\n"
             "• `/hits` - Multi-week net gain analysis for taking a hit (-4)"
         )
         await update.message.reply_text(welcome_text, parse_mode="Markdown")
@@ -469,4 +481,56 @@ class FPLBot:
         ]
         if not candidates:
             await update.message.reply_text(f"✅ Your lowest 3-GW rated player ({weakest['name']}) has no affordable upgrade for a hit analysis.")
-        
+            return
+
+        best = max(candidates, key=lambda p: self._get_3gw_score(p, fixtures, target_gw))
+        best_score = self._get_3gw_score(best, fixtures, target_gw)
+        gain = best_score - weakest['score']
+        net_gain = gain - 4.0
+
+        if net_gain > 0:
+            remaining_bank = max_budget - (best['now_cost'] / 10.0)
+            report = [
+                f"💡 **Hit (-4) Recommendation (GW {target_gw}-{target_gw+2})**\n",
+                f"🔴 **OUT:** [{POS_NAME[weakest['element_type']]}] {weakest['name']} (£{weakest['cost']}m) — 3-GW xP: {weakest['score']:.1f}",
+                f"🟢 **IN:** [{POS_NAME[best['element_type']]}] {best['web_name']} (£{best['now_cost']/10.0}m) — 3-GW xP: {best_score:.1f}",
+                f"📈 **Net Gain after -4 hit:** +{net_gain:.1f} xP",
+                f"💰 **Bank After:** £{remaining_bank:.1f}m",
+            ]
+        else:
+            report = [
+                f"💡 **Hit (-4) Analysis (GW {target_gw}-{target_gw+2})**\n",
+                f"❌ Taking a hit to replace {weakest['name']} with {best['web_name']} is **not recommended**.",
+                f"📈 Projected gain (+{gain:.1f} xP) does not outweigh the 4-point hit cost (Net: {net_gain:.1f} xP)."
+            ]
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+# --- Execution Entry Point ---
+if __name__ == "__main__":
+    BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN environment variable is missing!")
+        exit(1)
+
+    # Start the Flask web server in a background thread so Render's port bind succeeds
+    web_thread = Thread(target=run_web)
+    web_thread.daemon = True
+    web_thread.start()
+    logger.info("Background Flask health check server started.")
+
+    # Instantiate Bot
+    bot_instance = FPLBot()
+    
+    # Build Telegram Application
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Register Command Handlers
+    application.add_handler(CommandHandler("start", bot_instance.start))
+    application.add_handler(CommandHandler("setteam", bot_instance.set_team))
+    application.add_handler(CommandHandler("squad", bot_instance.squad))
+    application.add_handler(CommandHandler("freehit", bot_instance.free_hit))
+    application.add_handler(CommandHandler("transfers", bot_instance.transfers))
+    application.add_handler(CommandHandler("hits", bot_instance.hits))
+
+    logger.info("Starting FPL Telegram Bot via Polling...")
+    application.run_polling()
