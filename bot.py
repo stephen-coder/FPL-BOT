@@ -92,19 +92,41 @@ class FPLBot:
 
         return target_gw, pick_gw
 
-    def _fdr_map(self, fixtures, gw):
-        team_gw_fdr = {}
-        for f in fixtures:
-            if f['event'] == gw:
-                team_gw_fdr[f['team_h']] = f['team_h_difficulty']
-                team_gw_fdr[f['team_a']] = f['team_a_difficulty']
-        return team_gw_fdr
-
     def _is_available(self, p):
         status = p.get('status', 'a')
         chance = p.get('chance_of_playing_next_round', 100)
         chance = 100 if chance is None else chance
         return status == 'a' and chance >= 75
+
+    def _get_3gw_score(self, player, fixtures, start_gw):
+        """Calculates cumulative expected score over a 3-gameweek window."""
+        team_id = player['team']
+        base_ep = float(player.get('ep_next', 0) or 0)
+        form = float(player.get('form', 0) or 0)
+        available = self._is_available(player)
+
+        if not available:
+            return -50.0  - (3 * 20) # Heavy penalty across horizon if injured/suspended
+
+        total_score = 0.0
+        # Look ahead 3 gameweeks: start_gw, start_gw + 1, start_gw + 2
+        for gw_offset in range(3):
+            gw = start_gw + gw_offset
+            # Find fixtures for this team in this gameweek
+            gw_fixtures = [f for f in fixtures if f['event'] == gw and (f['team_h'] == team_id or f['team_a'] == team_id)]
+            
+            if not gw_fixtures:
+                # Blank Gameweek (no fixture)
+                continue
+            
+            for f in gw_fixtures:
+                is_home = (f['team_h'] == team_id)
+                fdr = f['team_h_difficulty'] if is_home else f['team_a_difficulty']
+                # Evaluate single GW score based on baseline EP, form, and fixture difficulty
+                gw_score = (base_ep * 2.0) + (form * 0.5) - (fdr * 0.8)
+                total_score += max(gw_score, 0.5) # Minimum floor for playing players
+
+        return total_score
 
     # ------------- Optimization -------------
 
@@ -173,14 +195,14 @@ class FPLBot:
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         welcome_text = (
-            "⚽ **Welcome to the FPL Assistant Bot!**\n\n"
+            "⚽ **Welcome to the Upgraded 3-GW Horizon FPL Bot!**\n\n"
             "**Core Commands:**\n"
             "• `/setteam <ID>` - Link your FPL Team ID\n"
-            "• `/squad` - Optimal starting XI & lineup (Next GW)\n"
+            "• `/squad` - Optimal starting XI (3-GW Horizon view)\n"
             "• `/freehit` - Generate optimal Free Hit squad\n"
-            "• `/transfers` - Personalized transfer suggestion from your squad\n"
+            "• `/transfers` - 3-GW Horizon transfer suggestion\n"
             "• `/live` - Live score & point tracker for current GW\n"
-            "• `/hits` - Transfer hit strategy advice"
+            "• `/hits` - Multi-week net gain analysis for taking a hit (-4)"
         )
         await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -201,10 +223,7 @@ class FPLBot:
             team_name = manager.get('name', 'Unknown Team')
             await update.message.reply_text(f"✅ Successfully linked!\n👤 **Manager:** {name}\n🛡️ **Team:** {team_name}")
         else:
-            await update.message.reply_text(
-                "⚠️ Team ID saved, but could not verify details from FPL API. "
-                "Check that your team ID is correct and public."
-            )
+            await update.message.reply_text("⚠️ Team ID saved, but could not verify details from FPL API.")
 
     async def squad(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         team_id = context.user_data.get('team_id')
@@ -212,7 +231,7 @@ class FPLBot:
             await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
             return
 
-        await update.message.reply_text("⏳ Analyzing your squad for the upcoming gameweek...")
+        await update.message.reply_text("⏳ Evaluating squad across the 3-gameweek horizon...")
 
         data = self.fetch_bootstrap_static()
         fixtures = self.fetch_fixtures()
@@ -223,25 +242,18 @@ class FPLBot:
         target_gw, pick_gw = self._get_target_and_pick_gw(data)
         picks_data = self.fetch_manager_gw_picks(team_id, pick_gw)
         if not picks_data or 'picks' not in picks_data:
-            await update.message.reply_text(
-                f"❌ Could not retrieve your squad (checked Gameweek {pick_gw}). "
-                "Double-check your Team ID."
-            )
+            await update.message.reply_text(f"❌ Could not retrieve your squad for GW {pick_gw}.")
             return
 
         players_dict = {p['id']: p for p in data['elements']}
-        fdr = self._fdr_map(fixtures, target_gw)
 
         pool = []
         for pick in picks_data['picks']:
             p_info = players_dict.get(pick['element'])
             if not p_info:
                 continue
-            f = fdr.get(p_info['team'], 3)
-            form = float(p_info.get('form', 0) or 0)
-            ep = float(p_info.get('ep_next', 0) or 0)
+            score = self._get_3gw_score(p_info, fixtures, target_gw)
             available = self._is_available(p_info)
-            score = (ep * 2.0) + (form * 1.0) - (f * 1.0) - (0 if available else 20)
             pool.append({
                 'id': p_info['id'],
                 'name': p_info['web_name'],
@@ -249,14 +261,11 @@ class FPLBot:
                 'now_cost': p_info['now_cost'] / 10.0,
                 'available': available,
                 'score': score,
-                'fdr': f,
             })
 
         starters, bench = self._solve_best_xi(pool)
         if not starters:
-            await update.message.reply_text(
-                "❌ Couldn't build a valid Starting XI from your squad data."
-            )
+            await update.message.reply_text("❌ Couldn't build a valid Starting XI.")
             return
 
         pos_order = {1: 1, 2: 2, 3: 3, 4: 4}
@@ -264,21 +273,21 @@ class FPLBot:
         captain = next((p for p in starters if p.get('is_captain')), starters[0])
         vice = next((p for p in starters if p.get('is_vice')), starters[1] if len(starters) > 1 else starters[0])
 
-        report = [f"⚽ **Gameweek {target_gw} Squad Lineup**\n", "🟢 **STARTING XI:**"]
+        report = [f"⚽ **3-GW Horizon Squad Lineup (GW {target_gw} - {target_gw+2})**\n", "🟢 **STARTING XI:**"]
         for p in starters:
             warn = " ⚠️ [Doubt]" if not p['available'] else ""
-            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['now_cost']}m) — FDR: {p['fdr']}{warn}")
+            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['now_cost']}m) — 3-GW xP: {p['score']:.1f}{warn}")
 
         report.append("\n🪑 **BENCH:**")
         for idx, p in enumerate(bench, 1):
-            report.append(f"{idx}. [{POS_NAME[p['element_type']]}] {p['name']} (£{p['now_cost']}m)")
+            report.append(f"{idx}. [{POS_NAME[p['element_type']]}] {p['name']} (£{p['now_cost']}m) — 3-GW xP: {p['score']:.1f}")
 
         report.append(f"\n⭐ **Captain:** {captain['name']}")
         report.append(f"🥈 **Vice-Captain:** {vice['name']}")
         await update.message.reply_text("\n".join(report), parse_mode="Markdown")
 
     async def free_hit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("⚡ Generating Free Hit squad within £100m budget...")
+        await update.message.reply_text("⚡ Generating 3-GW Optimized Free Hit squad...")
         data = self.fetch_bootstrap_static()
         fixtures = self.fetch_fixtures()
         if not data or not fixtures:
@@ -286,27 +295,24 @@ class FPLBot:
             return
 
         target_gw, _ = self._get_target_and_pick_gw(data)
-        fdr = self._fdr_map(fixtures, target_gw)
 
         candidates = []
         for p in data['elements']:
             if not self._is_available(p):
                 continue
-            f = fdr.get(p['team'], 3)
-            ep = float(p.get('ep_next', 0) or 0)
+            score = self._get_3gw_score(p, fixtures, target_gw)
             candidates.append({
                 'id': p['id'],
                 'name': p['web_name'],
                 'element_type': p['element_type'],
                 'cost': p['now_cost'] / 10.0,
                 'team': p['team'],
-                'score': (ep * 2.0) - (f * 1.0),
-                'fdr': f,
+                'score': score,
             })
 
         squad15 = self._solve_best_15(candidates, budget=100.0)
         if not squad15:
-            await update.message.reply_text("❌ Couldn't build a valid Free Hit squad within budget.")
+            await update.message.reply_text("❌ Couldn't build a valid Free Hit squad.")
             return
 
         starters, bench = self._solve_best_xi(squad15)
@@ -314,12 +320,12 @@ class FPLBot:
         captain = next((p for p in starters if p.get('is_captain')), None)
 
         report = [
-            f"⚡ **Free Hit Squad (GW {target_gw})**",
+            f"⚡ **Free Hit Horizon Squad (GW {target_gw}-{target_gw+2})**",
             f"💰 **Cost:** £{total_cost:.1f}m / £100.0m\n",
             "🛡️ **Starting XI:**",
         ]
         for p in sorted(starters, key=lambda x: x['element_type']):
-            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m) — FDR: {p['fdr']}")
+            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m) — 3-GW xP: {p['score']:.1f}")
 
         report.append("\n🪑 **Bench:**")
         for p in bench:
@@ -335,19 +341,18 @@ class FPLBot:
             await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
             return
 
-        await update.message.reply_text("🔄 Comparing your squad against the market for upgrades...")
+        await update.message.reply_text("🔄 Scanning 3-week fixture blocks for optimal transfers...")
 
         data = self.fetch_bootstrap_static()
-        if not data:
+        fixtures = self.fetch_fixtures()
+        if not data or not fixtures:
             await update.message.reply_text("❌ FPL API unreachable.")
             return
 
         target_gw, pick_gw = self._get_target_and_pick_gw(data)
         picks_data = self.fetch_manager_gw_picks(team_id, pick_gw)
         if not picks_data or 'picks' not in picks_data:
-            await update.message.reply_text(
-                f"❌ Could not retrieve your squad (checked Gameweek {pick_gw})."
-            )
+            await update.message.reply_text(f"❌ Could not retrieve your squad for GW {pick_gw}.")
             return
 
         players_dict = {p['id']: p for p in data['elements']}
@@ -359,9 +364,10 @@ class FPLBot:
             p = players_dict.get(pick['element'])
             if not p:
                 continue
+            score = self._get_3gw_score(p, fixtures, target_gw)
             owned.append({
                 'id': p['id'], 'name': p['web_name'], 'element_type': p['element_type'],
-                'cost': p['now_cost'] / 10.0, 'score': float(p.get('ep_next', 0) or 0),
+                'cost': p['now_cost'] / 10.0, 'score': score,
             })
 
         if not owned:
@@ -377,36 +383,104 @@ class FPLBot:
             and self._is_available(p) and (p['now_cost'] / 10.0) <= max_budget
         ]
         if not candidates:
-            await update.message.reply_text(
-                f"✅ Your weakest link ({weakest['name']}) has no affordable upgrade within your budget."
-            )
+            await update.message.reply_text(f"✅ Your lowest 3-GW rated player ({weakest['name']}) has no affordable upgrades.")
             return
 
-        best = max(candidates, key=lambda p: float(p.get('ep_next', 0) or 0))
-        gain = float(best.get('ep_next', 0) or 0) - weakest['score']
+        best = max(candidates, key=lambda p: self._get_3gw_score(p, fixtures, target_gw))
+        best_score = self._get_3gw_score(best, fixtures, target_gw)
+        gain = best_score - weakest['score']
 
-        if gain <= 0.5:
-            await update.message.reply_text(
-                f"✅ Your squad looks solid — no transfer clears the +0.5 xP bar for GW{target_gw}."
-            )
+        if gain <= 1.5: # Minimum threshold over 3 weeks
+            await update.message.reply_text(f"✅ Squad looks well-balanced for the next 3 weeks — no transfer clears the gain threshold.")
             return
 
         remaining_bank = max_budget - (best['now_cost'] / 10.0)
         report = [
-            f"🔄 **Suggested Transfer (GW {target_gw})**\n",
-            f"🔴 **OUT:** [{POS_NAME[weakest['element_type']]}] {weakest['name']} (£{weakest['cost']}m)",
-            f"🟢 **IN:** [{POS_NAME[best['element_type']]}] {best['web_name']} (£{best['now_cost']/10.0}m)",
-            f"📈 **Projected Gain:** +{gain:.2f} xP",
+            f"🔄 **Horizon Transfer Suggestion (GW {target_gw}-{target_gw+2})**\n",
+            f"🔴 **OUT:** [{POS_NAME[weakest['element_type']]}] {weakest['name']} (£{weakest['cost']}m) — 3-GW xP: {weakest['score']:.1f}",
+            f"🟢 **IN:** [{POS_NAME[best['element_type']]}] {best['web_name']} (£{best['now_cost']/10.0}m) — 3-GW xP: {best_score:.1f}",
+            f"📈 **3-Week Projected Gain:** +{gain:.1f} xP",
             f"💰 **Bank After:** £{remaining_bank:.1f}m",
         ]
         await update.message.reply_text("\n".join(report), parse_mode="Markdown")
 
     async def hits(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "💡 **Transfer Hit Strategy Advice:**\n\n"
-            "• **-4 Hit Worthiness:** Only take a hit if the incoming player outscores your outgoing player by **at least 4 more points** over 1-2 gameweeks.",
-            parse_mode="Markdown"
-        )
+        team_id = context.user_data.get('team_id')
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+
+        await update.message.reply_text("💡 Running multi-week hit (-4) valuation analysis...")
+
+        data = self.fetch_bootstrap_static()
+        fixtures = self.fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ FPL API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+        picks_data = self.fetch_manager_gw_picks(team_id, pick_gw)
+        if not picks_data or 'picks' not in picks_data:
+            await update.message.reply_text(f"❌ Could not retrieve your squad for GW {pick_gw}.")
+            return
+
+        players_dict = {p['id']: p for p in data['elements']}
+        bank = picks_data.get('entry_history', {}).get('bank', 0) / 10.0
+        owned_ids = {pick['element'] for pick in picks_data['picks']}
+
+        owned = []
+        for pick in picks_data['picks']:
+            p = players_dict.get(pick['element'])
+            if not p:
+                continue
+            score = self._get_3gw_score(p, fixtures, target_gw)
+            owned.append({
+                'id': p['id'], 'name': p['web_name'], 'element_type': p['element_type'],
+                'cost': p['now_cost'] / 10.0, 'score': score,
+            })
+
+        if not owned:
+            await update.message.reply_text("❌ Could not parse owned player elements.")
+            return
+
+        weakest = min(owned, key=lambda x: x['score'])
+        max_budget = weakest['cost'] + bank
+
+        candidates = [
+            p for p in data['elements']
+            if p['id'] not in owned_ids and p['element_type'] == weakest['element_type']
+            and self._is_available(p) and (p['now_cost'] / 10.0) <= max_budget
+        ]
+
+        if not candidates:
+            await update.message.reply_text(f"⚠️ No affordable upgrades found for your weakest player ({weakest['name']}).")
+            return
+
+        best = max(candidates, key=lambda p: self._get_3gw_score(p, fixtures, target_gw))
+        best_score = self._get_3gw_score(best, fixtures, target_gw)
+        gain = best_score - weakest['score']
+        net_gain = gain - 4.0 # Subtracting the 4-point hit cost
+
+        if net_gain <= 0:
+            await update.message.reply_text(
+                f"❌ **Hit Not Recommended (3-GW Horizon)**\n\n"
+                f"Replacing **{weakest['name']}** (3-GW xP: {weakest['score']:.1f}) with **{best['web_name']}** "
+                f"(3-GW xP: {best_score:.1f}) gives a 3-week gain of +{gain:.1f} xP. "
+                f"After accounting for the 4-point deduction, it yields a net gain of {net_gain:.1f} pts. Not worth a hit."
+            )
+            return
+
+        remaining_bank = max_budget - (best['now_cost'] / 10.0)
+        report = [
+            f"💡 **Hit Recommendation (3-GW Horizon)**\n",
+            f"🔴 **OUT:** [{POS_NAME[weakest['element_type']]}] {weakest['name']} (£{weakest['cost']}m) — 3-GW xP: {weakest['score']:.1f}",
+            f"🟢 **IN:** [{POS_NAME[best['element_type']]}] {best['web_name']} (£{best['now_cost']/10.0}m) — 3-GW xP: {best_score:.1f}",
+            f"📈 **3-Week Projected Gain:** +{gain:.1f} xP",
+            f"⚖️ **Net Gain (after -4 hit):** +{net_gain:.1f} pts",
+            f"💰 **Bank After:** £{remaining_bank:.1f}m",
+            f"\n*Verdict:* **Worth taking!** The favorable 3-week fixture swing easily outweighs the hit."
+        ]
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
 
     async def live_tracker(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         team_id = context.user_data.get('team_id')
@@ -426,7 +500,7 @@ class FPLBot:
         picks_data = self.fetch_manager_gw_picks(team_id, current_gw)
         live_data = self.fetch_live_gwdata(current_gw)
         if not picks_data or not live_data:
-            await update.message.reply_text(f"❌ Live point data for Gameweek {current_gw} is currently unavailable.")
+            await update.message.reply_text(f"❌ Live point data for Gameweek {current_gw} is unavailable.")
             return
 
         element_live = {item['id']: item['stats'] for item in live_data['elements']}
@@ -466,5 +540,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("hits", bot_instance.hits))
     app.add_handler(CommandHandler("live", bot_instance.live_tracker))
 
-    print("🤖 FPL Bot is up and running...")
+    print("🤖 Upgraded 3-GW Horizon FPL Bot is running...")
     app.run_polling()
