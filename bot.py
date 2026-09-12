@@ -12,7 +12,10 @@ logger = logging.getLogger(__name__)
 
 FPL_BASE_URL = "https://fantasy.premierleague.com/api/"
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://fantasy.premierleague.com/"
 }
 
 POS_NAME = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
@@ -20,13 +23,14 @@ POS_NAME = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
 
 class FPLBot:
     def __init__(self):
-        pass
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
 
     # ------------- API fetchers -------------
 
     def fetch_bootstrap_static(self):
         try:
-            response = requests.get(f"{FPL_BASE_URL}bootstrap-static/", headers=HEADERS, timeout=15)
+            response = self.session.get(f"{FPL_BASE_URL}bootstrap-static/", timeout=15)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -35,7 +39,7 @@ class FPLBot:
 
     def fetch_fixtures(self):
         try:
-            response = requests.get(f"{FPL_BASE_URL}fixtures/", headers=HEADERS, timeout=15)
+            response = self.session.get(f"{FPL_BASE_URL}fixtures/", timeout=15)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -44,7 +48,7 @@ class FPLBot:
 
     def fetch_manager_data(self, team_id):
         try:
-            response = requests.get(f"{FPL_BASE_URL}entry/{team_id}/", headers=HEADERS, timeout=15)
+            response = self.session.get(f"{FPL_BASE_URL}entry/{team_id}/", timeout=15)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -53,7 +57,7 @@ class FPLBot:
 
     def fetch_manager_gw_picks(self, team_id, gw):
         try:
-            response = requests.get(f"{FPL_BASE_URL}entry/{team_id}/event/{gw}/picks/", headers=HEADERS, timeout=15)
+            response = self.session.get(f"{FPL_BASE_URL}entry/{team_id}/event/{gw}/picks/", timeout=15)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -62,7 +66,7 @@ class FPLBot:
 
     def fetch_live_gwdata(self, gw):
         try:
-            response = requests.get(f"{FPL_BASE_URL}event/{gw}/live/", headers=HEADERS, timeout=15)
+            response = self.session.get(f"{FPL_BASE_URL}event/{gw}/live/", timeout=15)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -199,7 +203,7 @@ class FPLBot:
         else:
             await update.message.reply_text(
                 "⚠️ Team ID saved, but could not verify details from FPL API. "
-                "If commands keep failing, check that your team isn't set to Private."
+                "Check that your team ID is correct and public."
             )
 
     async def squad(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -221,7 +225,7 @@ class FPLBot:
         if not picks_data or 'picks' not in picks_data:
             await update.message.reply_text(
                 f"❌ Could not retrieve your squad (checked Gameweek {pick_gw}). "
-                "Double-check your Team ID, or that your team isn't set to Private."
+                "Double-check your Team ID."
             )
             return
 
@@ -257,8 +261,8 @@ class FPLBot:
 
         pos_order = {1: 1, 2: 2, 3: 3, 4: 4}
         starters.sort(key=lambda x: (pos_order[x['element_type']], -x['score']))
-        captain = next(p for p in starters if p['is_captain'])
-        vice = next(p for p in starters if p['is_vice'])
+        captain = next((p for p in starters if p.get('is_captain')), starters[0])
+        vice = next((p for p in starters if p.get('is_vice')), starters[1] if len(starters) > 1 else starters[0])
 
         report = [f"⚽ **Gameweek {target_gw} Squad Lineup**\n", "🟢 **STARTING XI:**"]
         for p in starters:
@@ -360,6 +364,10 @@ class FPLBot:
                 'cost': p['now_cost'] / 10.0, 'score': float(p.get('ep_next', 0) or 0),
             })
 
+        if not owned:
+            await update.message.reply_text("❌ Could not parse owned player elements.")
+            return
+
         weakest = min(owned, key=lambda x: x['score'])
         max_budget = weakest['cost'] + bank
 
@@ -445,13 +453,11 @@ class FPLBot:
 
 
 if __name__ == "__main__":
-    # Put your Telegram bot token here or use an environment variable
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
     
     bot_instance = FPLBot()
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Register handlers
     app.add_handler(CommandHandler("start", bot_instance.start))
     app.add_handler(CommandHandler("setteam", bot_instance.set_team))
     app.add_handler(CommandHandler("squad", bot_instance.squad))
