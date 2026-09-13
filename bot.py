@@ -379,6 +379,20 @@ async def initialize_telegram_app():
 # Run initialization immediately
 _loop.run_until_complete(initialize_telegram_app())
 
+# --- GLOBAL EVENT LOOP FOR TELEGRAM ---
+# Create a dedicated event loop for background async processing in Flask
+_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(_loop)
+
+# Initialize application once globally
+async def initialize_telegram_app():
+    if not application.running:
+        await application.initialize()
+        await application.start()
+
+# Run initialization immediately
+_loop.run_until_complete(initialize_telegram_app())
+
 # --- FLASK WEBHOOK ROUTE ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
