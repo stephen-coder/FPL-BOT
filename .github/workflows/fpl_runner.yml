@@ -3,11 +3,12 @@ import logging
 import time
 import sqlite3
 import asyncio
+from datetime import datetime
 from threading import Thread
 import pulp
 import requests
 from flask import Flask
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler
 
 logging.basicConfig(
@@ -152,6 +153,21 @@ class FPLBot:
                 logger.error(f"Error fetching manager history for team {team_id}: {e}")
                 return None
         return await asyncio.to_thread(fetch)
+
+    async def _fetch_live_event(self, gw):
+        def fetch():
+            try:
+                res = self.session.get(f"{FPL_BASE_URL}event/{gw}/live/", timeout=15)
+                res.raise_for_status()
+                return res.json()
+            except Exception as e:
+                logger.error(f"Error fetching live data for GW {gw}: {e}")
+                return None
+        return await asyncio.to_thread(fetch)
+
+    @staticmethod
+    def _fmt_rank(val):
+        return f"{val:,}" if isinstance(val, int) else "—"
 
     def _estimate_free_transfers(self, history_data, upto_event):
         """Reconstruct banked free transfers heading into the gameweek after `upto_event`,
@@ -416,18 +432,24 @@ class FPLBot:
     async def start(self, update: Update, context):
         welcome_text = (
             "⚽ **Welcome to the FPL Assistant Bot!**\n\n"
-            "**Core Commands:**\n"
-            "• `/setteam <ID>` - Link your FPL Team ID\n"
-            "• `/squad` - Optimal starting XI for the immediate GW\n"
-            "• `/freehit` - Generate optimal Free Hit squad for the upcoming GW\n"
-            "• `/transfers` - Marginal EV transfer suggestions\n"
-            "• `/hits` - Multi-week net gain (-4) valuation analysis\n\n"
+            "**Setup & Squad:**\n"
+            "• `/setteam <ID>` - Link your FPL Team ID to the chat session\n"
+            "• `/squad` - Optimal starting XI & lineup for your linked squad\n"
+            "• `/stats` - View manager rank, points, and team value\n\n"
+            "**Transfers:**\n"
+            "• `/transfers` - Multi-week fixture transfer planner\n"
+            "• `/hits` - Point hit ROI evaluator\n"
+            "• `/scout` - Top projected point-scorers for the upcoming gameweek\n"
+            "• `/prices` - Track upcoming deadlines, risers, and fallers\n\n"
             "**Chip Planning:**\n"
-            "• `/wildcard` - Long-horizon (6-GW) squad rebuild\n"
-            "• `/bboost` - Best upcoming week for Bench Boost\n"
-            "• `/triplecap` - Best upcoming week for Triple Captain\n\n"
-            "**Research:**\n"
-            "• `/differentials [max%] [POS]` - Low-ownership picks by xP"
+            "• `/freehit` - Generate an optimal 15-player Free Hit squad for next GW\n"
+            "• `/bestchip` - Scan upcoming DGWs and BGWs for chip timing\n"
+            "• `/benchboost` - Simulate optimal 15-player squad for Bench Boost\n"
+            "• `/triplecaptain` - Simulate top captaincy options and fixtures\n\n"
+            "**Live & Banter:**\n"
+            "• `/live` - Real-time live score tracker\n"
+            "• `/rival <Team ID>` - Spy on and compare stats with a rival\n"
+            "• `/roast` - Deliver a real talk check on gameweek scores"
         )
         await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -962,8 +984,10 @@ class FPLBot:
         report.append("\nℹ️ _This only weighs your current squad — a transfer or a newly confirmed double gameweek could change the picture closer to the week._")
         await update.message.reply_text("\n".join(report), parse_mode="Markdown")
 
-    async def differentials(self, update: Update, context):
-        max_own = 10.0
+    async def scout(self, update: Update, context):
+        """Top projected point-scorers for the upcoming GW. Optional args: a max ownership
+        %% (e.g. `10`) to scout differentials, and/or a position (GKP/DEF/MID/FWD)."""
+        max_own = 100.0
         pos_filter = None
         pos_map = {'GKP': 1, 'DEF': 2, 'MID': 3, 'FWD': 4}
         if context.args:
@@ -976,7 +1000,7 @@ class FPLBot:
                 except ValueError:
                     pass
 
-        await update.message.reply_text(f"🔍 Scanning for differentials under {max_own:.0f}% ownership...")
+        await update.message.reply_text("🔭 Scouting top projected scorers for the upcoming gameweek...")
 
         data = await self._fetch_bootstrap_static()
         fixtures = await self._fetch_fixtures()
@@ -1007,15 +1031,363 @@ class FPLBot:
             })
 
         if not candidates:
-            await update.message.reply_text("❌ No differentials found matching those filters.")
+            await update.message.reply_text("❌ No players found matching those filters.")
             return
 
         candidates.sort(key=lambda x: x['score'], reverse=True)
-        report = [f"🔍 **Top Differentials (GW {target_gw}, <{max_own:.0f}% owned)**\n"]
+        header = f"🔭 **Top Scouted Picks (GW {target_gw})**"
+        if max_own < 100:
+            header += f" — <{max_own:.0f}% owned"
+        report = [header + "\n"]
         for p in candidates[:10]:
             report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m, {p['owned_pct']:.1f}% owned) — xP: {p['score']:.1f}")
 
         await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def stats(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = self.db.get_team_id(chat_id)
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+
+        await update.message.reply_text("📈 Pulling your manager profile...")
+
+        data = await self._fetch_bootstrap_static()
+        if not data:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+        manager = await self._fetch_manager_data(team_id)
+        if not manager:
+            await update.message.reply_text("❌ Couldn't fetch your manager profile.")
+            return
+
+        picks_data = await self._fetch_manager_gw_picks(team_id, pick_gw)
+        gw_points = picks_data.get('entry_history', {}).get('points') if picks_data else None
+        gw_rank = picks_data.get('entry_history', {}).get('rank') if picks_data else None
+        bank = (manager.get('last_deadline_bank', 0) or 0) / 10.0
+        value = (manager.get('last_deadline_value', 0) or 0) / 10.0
+
+        name = f"{manager.get('player_first_name', '')} {manager.get('player_last_name', '')}".strip()
+        team_name = manager.get('name', 'Unknown Team')
+
+        report = [
+            f"📈 **{team_name}**",
+            f"👤 {name}\n",
+            f"🏆 **Overall Rank:** {self._fmt_rank(manager.get('summary_overall_rank'))}",
+            f"📊 **Overall Points:** {manager.get('summary_overall_points', '—')}",
+            f"📅 **GW{pick_gw} Points:** {gw_points if gw_points is not None else '—'}"
+            + (f" (rank {self._fmt_rank(gw_rank)})" if gw_rank else ""),
+            f"💰 **Team Value:** £{value:.1f}m",
+            f"🏦 **Bank:** £{bank:.1f}m",
+        ]
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def best_chip(self, update: Update, context):
+        await update.message.reply_text("🔮 Scanning fixture list for double and blank gameweeks...")
+
+        data = await self._fetch_bootstrap_static()
+        fixtures = await self._fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+        all_team_ids = {t['id'] for t in data['teams']}
+
+        LOOKAHEAD = 8
+        dgw_report, bgw_report = [], []
+        for offset in range(LOOKAHEAD):
+            gw = target_gw + offset
+            gw_fixtures = [f for f in fixtures if f['event'] == gw]
+            if not gw_fixtures:
+                continue  # not yet scheduled — don't misreport as a blank
+
+            team_counts = {}
+            for f in gw_fixtures:
+                team_counts[f['team_h']] = team_counts.get(f['team_h'], 0) + 1
+                team_counts[f['team_a']] = team_counts.get(f['team_a'], 0) + 1
+
+            dgw_teams = [t for t, c in team_counts.items() if c >= 2]
+            bgw_teams = [t for t in all_team_ids if team_counts.get(t, 0) == 0]
+            if dgw_teams:
+                dgw_report.append((gw, len(dgw_teams)))
+            if bgw_teams:
+                bgw_report.append((gw, len(bgw_teams)))
+
+        report = [f"🔮 **Chip Timing Scan (GW {target_gw}-{target_gw + LOOKAHEAD - 1})**\n"]
+        if dgw_report:
+            report.append("⚡ **Double Gameweeks:**")
+            for gw, count in dgw_report:
+                report.append(f"• GW{gw}: {count} team(s) with 2 fixtures")
+        else:
+            report.append("⚡ No confirmed double gameweeks in this window yet.")
+
+        report.append("")
+        if bgw_report:
+            report.append("🚫 **Blank Gameweeks:**")
+            for gw, count in bgw_report:
+                report.append(f"• GW{gw}: {count} team(s) with no fixture")
+        else:
+            report.append("🚫 No confirmed blank gameweeks in this window yet.")
+
+        report.append("")
+        if dgw_report:
+            best_dgw = max(dgw_report, key=lambda x: x[1])
+            report.append(f"💡 **GW{best_dgw[0]}** looks like the strongest week for Bench Boost / Triple Captain ({best_dgw[1]} teams with a double).")
+        if bgw_report:
+            best_bgw = max(bgw_report, key=lambda x: x[1])
+            report.append(f"💡 **GW{best_bgw[0]}** looks like a candidate for Free Hit ({best_bgw[1]} teams blank).")
+
+        report.append("\nℹ️ _Fixture schedules can change (postponements, rearrangements) — always confirm close to the deadline._")
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def live(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = self.db.get_team_id(chat_id)
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+
+        data = await self._fetch_bootstrap_static()
+        if not data:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        # Prefer the currently in-progress/most recent GW, not the upcoming one
+        live_gw = next((gw['id'] for gw in data['events'] if gw.get('is_current')), None)
+        if live_gw is None:
+            _, live_gw = self._get_target_and_pick_gw(data)
+
+        picks_data, live_data = await asyncio.gather(
+            self._fetch_manager_gw_picks(team_id, live_gw),
+            self._fetch_live_event(live_gw),
+        )
+        if not picks_data or 'picks' not in picks_data or not live_data:
+            await update.message.reply_text(f"❌ Couldn't retrieve live data for GW {live_gw}.")
+            return
+
+        live_stats = {el['id']: el.get('stats', {}) for el in live_data.get('elements', [])}
+        players_dict = {p['id']: p for p in data['elements']}
+
+        total_points = 0
+        lines = []
+        for pick in sorted(picks_data['picks'], key=lambda x: x['position']):
+            p_info = players_dict.get(pick['element'])
+            if not p_info:
+                continue
+            pts = live_stats.get(pick['element'], {}).get('total_points', 0)
+            mult = pick['multiplier']
+            if pick['position'] <= 11:
+                total_points += pts * mult
+
+            tag = " (C)" if pick.get('is_captain') else (" (VC)" if pick.get('is_vice_captain') else "")
+            bench_tag = "" if pick['position'] <= 11 else " [Bench]"
+            mult_tag = f" x{mult}" if mult > 1 else ""
+            lines.append(f"• {p_info['web_name']}{tag}{bench_tag}: {pts} pts{mult_tag}")
+
+        report = [f"📡 **Live Score — GW{live_gw}**\n", f"🏆 **Total:** {total_points} pts\n", *lines]
+        report.append("\nℹ️ _Refresh with `/live` — this bot doesn't push updates automatically._")
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def prices(self, update: Update, context):
+        await update.message.reply_text("💹 Checking deadline and price movement signals...")
+
+        data = await self._fetch_bootstrap_static()
+        if not data:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        next_event = next((e for e in data['events'] if e.get('is_next')), None)
+        deadline_line = "⏰ No upcoming deadline found."
+        if next_event:
+            try:
+                dt = datetime.fromisoformat(next_event['deadline_time'].replace('Z', '+00:00'))
+                deadline_line = f"⏰ **Next Deadline (GW{next_event['id']}):** {dt.strftime('%a %d %b, %H:%M UTC')}"
+            except (ValueError, KeyError):
+                deadline_line = f"⏰ **Next Deadline (GW{next_event['id']}):** {next_event.get('deadline_time', '—')}"
+
+        elements = data['elements']
+        already_changed = sorted(
+            (p for p in elements if p.get('cost_change_event', 0) != 0),
+            key=lambda p: abs(p['cost_change_event']), reverse=True
+        )
+        by_net = sorted(elements, key=lambda p: p.get('transfers_in_event', 0) - p.get('transfers_out_event', 0), reverse=True)
+        risers = [p for p in by_net if (p.get('transfers_in_event', 0) - p.get('transfers_out_event', 0)) > 0][:5]
+        fallers = list(reversed([p for p in by_net if (p.get('transfers_in_event', 0) - p.get('transfers_out_event', 0)) < 0]))[:5]
+
+        report = [f"💹 **Price Watch**\n", deadline_line, ""]
+        if already_changed:
+            report.append("📊 **Already changed today:**")
+            for p in already_changed[:8]:
+                direction = "🔼" if p['cost_change_event'] > 0 else "🔽"
+                report.append(f"{direction} {p['web_name']}: £{p['now_cost']/10:.1f}m ({p['cost_change_event']/10:+.1f})")
+            report.append("")
+
+        if risers:
+            report.append("📈 **Likely risers tonight (net transfers in):**")
+            for p in risers:
+                net = p.get('transfers_in_event', 0) - p.get('transfers_out_event', 0)
+                report.append(f"• {p['web_name']} (£{p['now_cost']/10:.1f}m) — net +{net:,}")
+            report.append("")
+
+        if fallers:
+            report.append("📉 **Likely fallers tonight (net transfers out):**")
+            for p in fallers:
+                net = p.get('transfers_in_event', 0) - p.get('transfers_out_event', 0)
+                report.append(f"• {p['web_name']} (£{p['now_cost']/10:.1f}m) — net {net:,}")
+
+        report.append("\nℹ️ _Net transfer volume is a signal, not a guarantee — actual changes depend on FPL's internal algorithm._")
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def rival(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = self.db.get_team_id(chat_id)
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+        if not context.args or not context.args[0].isdigit():
+            await update.message.reply_text("⚠️ Usage: `/rival <Team ID>`", parse_mode="Markdown")
+            return
+        rival_id = context.args[0]
+
+        await update.message.reply_text("🕵️ Spying on rival squad...")
+
+        data = await self._fetch_bootstrap_static()
+        fixtures = await self._fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+
+        my_manager, rival_manager = await asyncio.gather(
+            self._fetch_manager_data(team_id), self._fetch_manager_data(rival_id)
+        )
+        if not my_manager or not rival_manager:
+            await update.message.reply_text("❌ Couldn't fetch one of the team profiles — check the rival Team ID.")
+            return
+
+        my_picks, rival_picks = await asyncio.gather(
+            self._fetch_manager_gw_picks(team_id, pick_gw), self._fetch_manager_gw_picks(rival_id, pick_gw)
+        )
+
+        players_dict = {p['id']: p for p in data['elements']}
+
+        def projected_total(picks_data):
+            if not picks_data or 'picks' not in picks_data:
+                return None
+            total = 0.0
+            for pick in picks_data['picks']:
+                if pick['position'] > 11:
+                    continue
+                p_info = players_dict.get(pick['element'])
+                if not p_info:
+                    continue
+                total += self._calculate_single_gw_xpts(p_info, fixtures, target_gw) * pick['multiplier']
+            return total
+
+        my_proj = projected_total(my_picks)
+        rival_proj = projected_total(rival_picks)
+
+        def profile_block(label, manager, proj):
+            name = f"{manager.get('player_first_name', '')} {manager.get('player_last_name', '')}".strip()
+            lines = [
+                f"{label} — **{manager.get('name', 'Unknown Team')}** ({name})",
+                f"🏆 Rank: {self._fmt_rank(manager.get('summary_overall_rank'))} | 📊 Points: {manager.get('summary_overall_points', '—')}",
+                f"💰 Value: £{(manager.get('last_deadline_value', 0) or 0) / 10:.1f}m",
+            ]
+            if proj is not None:
+                lines.append(f"🔮 Projected GW{target_gw}: {proj:.1f} pts")
+            return lines
+
+        report = ["🕵️ **Rival Check**\n"]
+        report += profile_block("👤 You", my_manager, my_proj)
+        report.append("")
+        report += profile_block("🎯 Rival", rival_manager, rival_proj)
+
+        if my_proj is not None and rival_proj is not None:
+            diff = my_proj - rival_proj
+            if diff > 0.5:
+                report.append(f"\n✅ You're projected to win this GW by {diff:.1f} pts.")
+            elif diff < -0.5:
+                report.append(f"\n⚠️ Rival is projected to outscore you by {-diff:.1f} pts.")
+            else:
+                report.append("\n🤝 Dead even on projection.")
+
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def roast(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = self.db.get_team_id(chat_id)
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+
+        await update.message.reply_text("🔥 Pulling up the tape...")
+
+        data = await self._fetch_bootstrap_static()
+        if not data:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+        event = next((e for e in data['events'] if e['id'] == pick_gw), None)
+        avg_score = event.get('average_entry_score') if event else None
+        highest_score = event.get('highest_score') if event else None
+
+        picks_data = await self._fetch_manager_gw_picks(team_id, pick_gw)
+        my_score = picks_data.get('entry_history', {}).get('points') if picks_data else None
+
+        if my_score is None or not avg_score:
+            await update.message.reply_text("❌ No completed gameweek score to roast yet — check back after kickoff.")
+            return
+
+        diff = my_score - avg_score
+        report = [f"🔥 **GW{pick_gw} Real Talk**\n", f"Your score: **{my_score}** pts", f"Average: {avg_score} pts"]
+        if highest_score:
+            report.append(f"Highest: {highest_score} pts")
+        report.append("")
+
+        if diff >= 20:
+            line = "Absolutely cooked the average. Screenshot this before it regresses to the mean."
+        elif diff >= 8:
+            line = "Solidly above the pack. Not bragging rights yet, but you're allowed a small smile."
+        elif diff > -3:
+            line = "Right around the average — the FPL equivalent of a shrug emoji."
+        elif diff > -15:
+            line = "Below the curve. The captain pick is probably the first suspect."
+        else:
+            line = "Rough week. This is the kind of scoreline that ends in a Wildcard by Thursday."
+        report.append(f"_{line}_")
+
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+
+BOT_COMMANDS = [
+    ("start", "Launch the FPL Assistant and view the main menu"),
+    ("setteam", "Link your FPL Team ID to the chat session"),
+    ("squad", "Optimal starting XI & lineup for your linked squad"),
+    ("freehit", "Generate an optimal 15-player Free Hit squad for next GW"),
+    ("scout", "Top projected point-scorers for the upcoming gameweek"),
+    ("stats", "View manager rank, points, and team value"),
+    ("transfers", "Multi-week fixture transfer planner"),
+    ("hits", "Point hit ROI evaluator"),
+    ("bestchip", "Scan upcoming DGWs and BGWs for chip timing"),
+    ("benchboost", "Simulate optimal 15-player squad for Bench Boost"),
+    ("triplecaptain", "Simulate top captaincy options and fixtures"),
+    ("live", "Real-time live score tracker"),
+    ("prices", "Track upcoming deadlines, risers, and fallers"),
+    ("rival", "Spy on and compare stats with a rival"),
+    ("roast", "Deliver a real talk check on gameweek scores"),
+]
+
+
+async def _post_init(application: Application):
+    # Registers the exact command menu Telegram shows in the "/" autocomplete picker.
+    await application.bot.set_my_commands([BotCommand(cmd, desc) for cmd, desc in BOT_COMMANDS])
 
 
 def start_telegram_bot():
@@ -1025,18 +1397,25 @@ def start_telegram_bot():
         return
 
     bot_instance = FPLBot()
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
 
     application.add_handler(CommandHandler("start", bot_instance.start))
     application.add_handler(CommandHandler("setteam", bot_instance.set_team))
     application.add_handler(CommandHandler("squad", bot_instance.squad))
     application.add_handler(CommandHandler("freehit", bot_instance.free_hit))
+    application.add_handler(CommandHandler("scout", bot_instance.scout))
+    application.add_handler(CommandHandler("stats", bot_instance.stats))
     application.add_handler(CommandHandler("transfers", bot_instance.transfers))
     application.add_handler(CommandHandler("hits", bot_instance.hits))
+    application.add_handler(CommandHandler("bestchip", bot_instance.best_chip))
+    application.add_handler(CommandHandler("benchboost", bot_instance.bench_boost))
+    application.add_handler(CommandHandler("triplecaptain", bot_instance.triple_captain))
+    application.add_handler(CommandHandler("live", bot_instance.live))
+    application.add_handler(CommandHandler("prices", bot_instance.prices))
+    application.add_handler(CommandHandler("rival", bot_instance.rival))
+    application.add_handler(CommandHandler("roast", bot_instance.roast))
+    # Kept working but left off the Telegram menu since it wasn't in the requested list:
     application.add_handler(CommandHandler("wildcard", bot_instance.wildcard))
-    application.add_handler(CommandHandler("bboost", bot_instance.bench_boost))
-    application.add_handler(CommandHandler("triplecap", bot_instance.triple_captain))
-    application.add_handler(CommandHandler("differentials", bot_instance.differentials))
 
     logger.info("Starting FPL Telegram Bot via Polling...")
     application.run_polling()
