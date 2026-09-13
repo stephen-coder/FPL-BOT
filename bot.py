@@ -278,7 +278,6 @@ async def squad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     starters, bench, captain, vice = result
     
-    # Group starters by position
     pos_map = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
     starters_by_pos = {1: [], 2: [], 3: [], 4: []}
     for p in starters:
@@ -366,32 +365,16 @@ application.add_handler(CommandHandler("chips", chips_command))
 
 
 # --- GLOBAL EVENT LOOP FOR TELEGRAM ---
-# Create a dedicated event loop for background async processing in Flask
 _loop = asyncio.new_event_loop()
 asyncio.set_event_loop(_loop)
 
-# Initialize application once globally
 async def initialize_telegram_app():
     if not application.running:
         await application.initialize()
         await application.start()
 
-# Run initialization immediately
 _loop.run_until_complete(initialize_telegram_app())
 
-# --- GLOBAL EVENT LOOP FOR TELEGRAM ---
-# Create a dedicated event loop for background async processing in Flask
-_loop = asyncio.new_event_loop()
-asyncio.set_event_loop(_loop)
-
-# Initialize application once globally
-async def initialize_telegram_app():
-    if not application.running:
-        await application.initialize()
-        await application.start()
-
-# Run initialization immediately
-_loop.run_until_complete(initialize_telegram_app())
 
 # --- FLASK WEBHOOK ROUTE ---
 @app.route('/webhook', methods=['POST'])
@@ -403,9 +386,8 @@ def webhook():
         await application.process_update(update)
 
     try:
-        # Safely schedule the update processing in our persistent event loop
         future = asyncio.run_coroutine_threadsafe(process(), _loop)
-        future.result(timeout=10)  # Wait up to 10 seconds for completion
+        future.result(timeout=10)
     except Exception as e:
         print(f"Error processing update: {e}")
 
