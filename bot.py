@@ -365,6 +365,20 @@ application.add_handler(CommandHandler("live", live_command))
 application.add_handler(CommandHandler("chips", chips_command))
 
 
+# --- GLOBAL EVENT LOOP FOR TELEGRAM ---
+# Create a dedicated event loop for background async processing in Flask
+_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(_loop)
+
+# Initialize application once globally
+async def initialize_telegram_app():
+    if not application.running:
+        await application.initialize()
+        await application.start()
+
+# Run initialization immediately
+_loop.run_until_complete(initialize_telegram_app())
+
 # --- FLASK WEBHOOK ROUTE ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -372,18 +386,16 @@ def webhook():
     update = Update.de_json(json_data, bot)
     
     async def process():
-        if not application.running:
-            await application.initialize()
-            await application.start()
         await application.process_update(update)
 
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.run_coroutine_threadsafe(process(), loop)
-        else:
-            asyncio.run(process())
-    except RuntimeError:
-        asyncio.run(process())
+        # Safely schedule the update processing in our persistent event loop
+        future = asyncio.run_coroutine_threadsafe(process(), _loop)
+        future.result(timeout=10)  # Wait up to 10 seconds for completion
+    except Exception as e:
+        print(f"Error processing update: {e}")
 
     return "OK", 200
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
