@@ -365,13 +365,12 @@ application.add_handler(CommandHandler("live", live_command))
 application.add_handler(CommandHandler("chips", chips_command))
 
 
-# --- FLASK WEBHOOK ROUTE (Fixed Lifecycle) ---
+# --- FLASK WEBHOOK ROUTE ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     json_data = request.get_json(force=True)
     update = Update.de_json(json_data, bot)
     
-    # Properly run updates in the background thread loop without re-initializing the app every time
     async def process():
         if not application.running:
             await application.initialize()
@@ -381,7 +380,6 @@ def webhook():
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            # If running in a nested environment, schedule task safely
             asyncio.run_coroutine_threadsafe(process(), loop)
         else:
             asyncio.run(process())
@@ -389,6 +387,3 @@ def webhook():
         asyncio.run(process())
 
     return "OK", 200
-
-if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
