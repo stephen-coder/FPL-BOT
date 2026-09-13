@@ -364,32 +364,57 @@ application.add_handler(CommandHandler("live", live_command))
 application.add_handler(CommandHandler("chips", chips_command))
 
 
-# --- GLOBAL EVENT LOOP FOR TELEGRAM ---
-_loop = asyncio.new_event_loop()
-asyncio.set_event_loop(_loop)
+# --- LAZY-INITIALIZED EVENT LOOP & TELEGRAM APP FOR GUNICORN ---
+_loop = None
+_init_lock = asyncio.Lock()
 
-async def initialize_telegram_app():
+def get_or_create_event_loop():
+    global _loop
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+        
+    if loop and loop.is_running():
+        return loop
+        
+    if _loop is None or _loop.is_closed():
+        _loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_loop)
+    return _loop
+
+async def ensure_telegram_initialized():
     if not application.running:
-        await application.initialize()
-        await application.start()
-
-_loop.run_until_complete(initialize_telegram_app())
+        try:
+            await application.initialize()
+            await application.start()
+        except Exception:
+            pass
 
 
 # --- FLASK WEBHOOK ROUTE ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    import traceback
     json_data = request.get_json(force=True)
     update = Update.de_json(json_data, bot)
     
+    loop = get_or_create_event_loop()
+
     async def process():
+        await ensure_telegram_initialized()
         await application.process_update(update)
 
     try:
-        future = asyncio.run_coroutine_threadsafe(process(), _loop)
-        future.result(timeout=10)
+        if loop.is_running():
+            # If called from an async context within the loop
+            future = asyncio.run_coroutine_threadsafe(process(), loop)
+            future.result(timeout=10)
+        else:
+            loop.run_until_complete(process())
     except Exception as e:
-        print(f"Error processing update: {e}")
+        print("Error processing update:")
+        traceback.print_exc()
 
     return "OK", 200
 
