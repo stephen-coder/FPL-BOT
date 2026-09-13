@@ -185,20 +185,40 @@ application.add_handler(CommandHandler("start", fpl_bot.start))
 application.add_handler(CommandHandler("setteam", fpl_bot.set_team))
 application.add_handler(CommandHandler("squad", fpl_bot.squad))
 
-# Initialize application async workflow
-async def setup_webhook():
-    await application.initialize()
-
-# Run initialization loop once on startup
-loop = asyncio.get_event_loop()
-loop.run_until_complete(setup_webhook())
+# Track initialization state to avoid running it multiple times
+_is_initialized = False
 
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
     """Endpoint that receives updates from Telegram securely via Webhook"""
+    global _is_initialized
+    
+    # Lazily initialize the Telegram application on the first incoming request
+    if not _is_initialized:
+        async def init_app():
+            await application.initialize()
+        
+        try:
+            asyncio.run(init_app())
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(init_app())
+        
+        _is_initialized = True
+
     if request.method == "POST":
         json_update = request.get_json(force=True)
         update = Update.de_json(json_update, application.bot)
-        # Process update asynchronously in the app event loop
-        asyncio.run_coroutine_threadsafe(application.process_update(update), application.loop)
+        
+        # Safely process the update asynchronously
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.run_coroutine_threadsafe(application.process_update(update), loop)
+            else:
+                asyncio.run(application.process_update(update))
+        except Exception:
+            asyncio.run(application.process_update(update))
+            
     return "OK", 200
