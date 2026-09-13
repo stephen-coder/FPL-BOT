@@ -176,31 +176,41 @@ class FPLBot:
         await update.message.reply_text(f"🔍 Fetching optimal squad for team {team_id}...")
 
 
-# --- Initialize Telegram Application & Webhook Route ---
+# --- Initialize Telegram Application & Webhook Route (Lazy Loaded) ---
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 fpl_bot = FPLBot()
 
-application = Application.builder().token(TOKEN).build()
-application.add_handler(CommandHandler("start", fpl_bot.start))
-application.add_handler(CommandHandler("setteam", fpl_bot.set_team))
-application.add_handler(CommandHandler("squad", fpl_bot.squad))
-
-# Track initialization state to avoid running it multiple times
+application = None
 _is_initialized = False
+
+def get_telegram_app():
+    global application
+    if application is None:
+        application = Application.builder().token(TOKEN).build()
+        application.add_handler(CommandHandler("start", fpl_bot.start))
+        application.add_handler(CommandHandler("setteam", fpl_bot.set_team))
+        application.add_handler(CommandHandler("squad", fpl_bot.squad))
+    return application
 
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
     """Endpoint that receives updates from Telegram securely via Webhook"""
     global _is_initialized
+    app_instance = get_telegram_app()
     
-    # Lazily initialize the Telegram application on the first incoming request
+    # Lazily initialize the Telegram application safely inside the request context loop
     if not _is_initialized:
         async def init_app():
-            await application.initialize()
+            await app_instance.initialize()
         
         try:
-            asyncio.run(init_app())
-        except RuntimeError:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(init_app(), loop)
+                future.result(timeout=10)
+            else:
+                asyncio.run(init_app())
+        except Exception:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(init_app())
@@ -209,16 +219,16 @@ def webhook():
 
     if request.method == "POST":
         json_update = request.get_json(force=True)
-        update = Update.de_json(json_update, application.bot)
+        update = Update.de_json(json_update, app_instance.bot)
         
-        # Safely process the update asynchronously
+        # Safely process the incoming update
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                asyncio.run_coroutine_threadsafe(application.process_update(update), loop)
+                asyncio.run_coroutine_threadsafe(app_instance.process_update(update), loop)
             else:
-                asyncio.run(application.process_update(update))
+                asyncio.run(app_instance.process_update(update))
         except Exception:
-            asyncio.run(application.process_update(update))
+            asyncio.run(app_instance.process_update(update))
             
     return "OK", 200
