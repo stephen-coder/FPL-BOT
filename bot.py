@@ -1358,7 +1358,7 @@ class FPLBot:
         elif diff > -3:
             line = "Right around the average — the FPL equivalent of a shrug emoji."
         elif diff > -15:
-            line = "Below the curve. The captain pick is probably the first suspect."
+            line = "Below the curve. The captains pick is probably the first suspect."
         else:
             line = "Rough week. This is the kind of scoreline that ends in a Wildcard by Thursday."
         report.append(f"_{line}_")
