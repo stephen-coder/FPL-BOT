@@ -456,7 +456,7 @@ class FPLBot:
     async def set_team(self, update: Update, context):
         chat_id = update.effective_chat.id
         if not context.args:
-            await update.message.reply_text("⚠️ Please provide your FPL Team ID. Example: `/setteam 1234567`", parse_mode="Markdown")
+            await update.message.reply_text("⚠️ Please provide your FPLs Team ID. Example: `/setteam 1234567`", parse_mode="Markdown")
             return
 
         team_id = context.args[0]
