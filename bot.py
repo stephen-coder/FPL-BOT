@@ -1607,11 +1607,14 @@ except Exception as e:
 
 
 # --- Flask Webhook Endpoint ---
+import asyncio
+from flask import Flask, request
+from telegram import Update
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if request.headers.get('content-type') == 'application/json':
         json_data = request.get_json(force=True)
-        
         update = Update.de_json(json_data, app_tg.bot)
         
         async def process_update():
@@ -1620,9 +1623,18 @@ def webhook():
                 await app_tg.start()
             await app_tg.process_update(update)
 
-        asyncio.run(process_update())
+        # Safely run the async task in a new or current loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If an event loop is already bound to this thread, run via run_coroutine_threadsafe or create task
+                future = asyncio.run_coroutine_threadsafe(process_update(), loop)
+                future.result(timeout=30)
+            else:
+                asyncio.run(process_update())
+        except Exception as e:
+            logger.error(f"Error processing webhook update: {e}")
+            return "Internal Error", 500
+            
         return "OK", 200
     return "Forbidden", 403
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
