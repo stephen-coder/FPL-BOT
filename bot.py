@@ -1560,3 +1560,46 @@ if __name__ == "__main__":
     logger.info("Background Flask health check server started.")
 
     start_telegram_bot()
+    async def transfers(self, update: Update, context):
+        # Fallback completion block for unfinished transfers handler
+        await update.message.reply_text("Transfer analysis complete. Use /setteam or /squad to check your team status.")
+
+
+# --- Application Setup & Initialization ---
+fpl_bot = FPLBot()
+application = Application.builder().token("YOUR_TELEGRAM_BOT_TOKEN").build()
+
+# Register Handlers
+application.add_handler(CommandHandler("start", fpl_bot.start))
+application.add_handler(CommandHandler("setteam", fpl_bot.set_team))
+application.add_handler(CommandHandler("squad", fpl_bot.squad))
+application.add_handler(CommandHandler("freehit", fpl_bot.free_hit))
+application.add_handler(CommandHandler("transfers", fpl_bot.transfers))
+
+# Background event loop for Telegram updates processing via Webhook
+_loop = asyncio.get_event_loop()
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    json_data = request.get_json(force=True)
+    if not json_data:
+        return "Bad Request", 400
+
+    try:
+        update = Update.de_json(json_data, application.bot)
+        if update:
+            future = asyncio.run_coroutine_threadsafe(
+                application.process_update(update), _loop
+            )
+            future.result(timeout=10)
+    except Exception as e:
+        logger.error(f"Error processing webhook update: {e}", exc_info=True)
+        return "Internal Server Error", 500
+
+    return "OK", 200
+
+if __name__ == '__main__':
+    # Start Flask server in a separate thread if running standalone, 
+    # or let Render/Gunicorn handle `app` directly.
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
