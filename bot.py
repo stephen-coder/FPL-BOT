@@ -1531,7 +1531,7 @@ if not TOKEN:
     logger.warning("TELEGRAM_BOT_TOKEN is not set.")
 
 bot = Bot(token=TOKEN if TOKEN else "000000:INVALID")
-application = Application.builder().bot(bot).updater(None).build()
+update = Update.de_json(json_data, application.bot))
 bot_instance = FPLBot()
 
 application.add_handler(CommandHandler("start", bot_instance.start))
