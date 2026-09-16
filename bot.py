@@ -1606,31 +1606,23 @@ except Exception as e:
     logger.error(f"Bot startup failed: {e}")
 
 
-# --- Flask webhook route ---
-@app.route('/webhook', methods=['POST'])
+# --- Flask Webhook Endpoint ---
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    if WEBHOOK_SECRET:
-        token = request.headers.get('X-Telegram-Bot-Api-Secret-Token', '')
-        if token != WEBHOOK_SECRET:
-            return "Forbidden", 403
+    if request.headers.get('content-type') == 'application/json':
+        json_data = request.get_json(force=True)
+        
+        update = Update.de_json(json_data, app_tg.bot)
+        
+        async def process_update():
+            if not app_tg.running:
+                await app_tg.initialize()
+                await app_tg.start()
+            await app_tg.process_update(update)
 
-    json_data = request.get_json(force=True, silent=True)
-    if not json_data:
-        return "Bad Request", 400
-
-    update = Update.de_json(json_data, bot)
-
-    async def process():
-        await application.process_update(update)
-
-    try:
-        future = asyncio.run_coroutine_threadsafe(process(), _loop)
-        future.result(timeout=25)
-    except Exception as e:
-        logger.error(f"Error processing update: {e}")
-
-    return "OK", 200
-
+        asyncio.run(process_update())
+        return "OK", 200
+    return "Forbidden", 403
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
