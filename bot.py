@@ -16,6 +16,53 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g., https://fpl-telegram-bot-63un.onrender.com/webhook
+
+app = Flask(__name__)
+
+# 1. Build the Telegram Application
+ptb_application = Application.builder().token(TOKEN).build()
+
+# 2. Create a dedicated background asyncio event loop thread
+loop = asyncio.new_event_loop()
+
+def run_async_loop(event_loop):
+    asyncio.set_event_loop(event_loop)
+    event_loop.run_forever()
+
+threading.Thread(target=run_async_loop, args=(loop,), daemon=True).start()
+
+# 3. Async startup routine to initialize the bot and register the webhook
+async def post_init():
+    await ptb_application.initialize()
+    await ptb_application.start()
+    if WEBHOOK_URL:
+        await ptb_application.bot.set_webhook(url=WEBHOOK_URL)
+        logger.info(f"Webhook registered at {WEBHOOK_URL}")
+
+# Dispatch initialization to the background loop immediately on startup
+asyncio.run_coroutine_threadsafe(post_init(), loop)
+
+# 4. Flask Webhook Route
+@app.route("/webhook", methods=["POST"])
+def telegram_webhook():
+    if request.headers.get("content-type") == "application/json":
+        json_data = request.get_json(force=True)
+        update = Update.de_json(json_data, ptb_application.bot)
+        
+        # Safely hand off update processing to the background loop
+        asyncio.run_coroutine_threadsafe(
+            ptb_application.process_update(update), 
+            loop
+        )
+        return "", 200
+    return "Forbidden", 403
+
+@app.route("/", methods=["GET"])
+def index():
+    return "FPL Telegram Bot is live!", 200
+    
 # --- Notes ---
 # This is the single, consolidated bot: the full command set/ILP engine, running on
 # webhooks instead of polling. Key points if you're picking this up cold:
