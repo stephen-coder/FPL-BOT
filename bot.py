@@ -1605,36 +1605,30 @@ try:
 except Exception as e:
     logger.error(f"Bot startup failed: {e}")
 
-
 # --- Flask Webhook Endpoint ---
 import asyncio
 from flask import Flask, request
 from telegram import Update
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        json_data = request.get_json(force=True)
-        update = Update.de_json(json_data, app_tg.bot)
-        
-        async def process_update():
-            if not app_tg.running:
-                await app_tg.initialize()
-                await app_tg.start()
-            await app_tg.process_update(update)
+import asyncio
+from flask import Flask, request
+from telegram import Update
 
-        # Safely run the async task in a new or current loop
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # If an event loop is already bound to this thread, run via run_coroutine_threadsafe or create task
-                future = asyncio.run_coroutine_threadsafe(process_update(), loop)
-                future.result(timeout=30)
-            else:
-                asyncio.run(process_update())
-        except Exception as e:
-            logger.error(f"Error processing webhook update: {e}")
-            return "Internal Error", 500
-            
-        return "OK", 200
-    return "Forbidden", 403
+# (Your existing Flask app and application initialization...)
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    # 1. Get the JSON payload sent by Telegram
+    json_data = request.get_json(force=True)
+    
+    # 2. Parse the update using the bot instance safely inside the function
+    update = Update.de_json(json_data, application.bot)
+    
+    # 3. Process the update asynchronously (required for python-telegram-bot v20+)
+    if update:
+        asyncio.run_coroutine_threadsafe(
+            application.process_update(update), 
+            application.updater.bot.loop if hasattr(application, 'updater') and application.updater else asyncio.get_event_loop()
+        )
+        
+    return "OK", 200
