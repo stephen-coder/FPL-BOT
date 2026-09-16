@@ -1,3 +1,4 @@
+# name=bot.py
 import os
 import logging
 import time
@@ -1530,8 +1531,7 @@ BOT_COMMANDS = [
 if not TOKEN:
     logger.warning("TELEGRAM_BOT_TOKEN is not set.")
 
-bot = Bot(token=TOKEN if TOKEN else "000000:INVALID")
-update = Update.de_json(json_data, application.bot)
+application = Application.builder().token(TOKEN if TOKEN else "000000:INVALID").build()
 bot_instance = FPLBot()
 
 application.add_handler(CommandHandler("start", bot_instance.start))
@@ -1549,7 +1549,6 @@ application.add_handler(CommandHandler("live", bot_instance.live))
 application.add_handler(CommandHandler("prices", bot_instance.prices))
 application.add_handler(CommandHandler("rival", bot_instance.rival))
 application.add_handler(CommandHandler("roast", bot_instance.roast))
-# Kept working but left off the Telegram menu since it wasn't in the requested list:
 application.add_handler(CommandHandler("wildcard", bot_instance.wildcard))
 
 
@@ -1567,13 +1566,6 @@ application.add_error_handler(_error_handler)
 
 
 # --- Global event loop running in a background thread ---
-# Telegram updates arrive as Flask (synchronous) POST requests, but the bot's
-# handlers are async. The loop below runs forever in its own thread so Flask's
-# webhook route can hand it work via run_coroutine_threadsafe() and get a result
-# back. If this loop were only driven once at startup and then left to stop (a
-# real bug from an earlier draft), every later run_coroutine_threadsafe() call
-# would schedule a coroutine nobody is executing, and the webhook would silently
-# time out on every single update.
 _loop = asyncio.new_event_loop()
 
 def _run_loop_forever(loop):
@@ -1605,30 +1597,22 @@ try:
 except Exception as e:
     logger.error(f"Bot startup failed: {e}")
 
+
 # --- Flask Webhook Endpoint ---
-import asyncio
-from flask import Flask, request
-from telegram import Update
-
-import asyncio
-from flask import Flask, request
-from telegram import Update
-
-# (Your existing Flask app and application initialization...)
-
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    # 1. Get the JSON payload sent by Telegram
+    if WEBHOOK_SECRET:
+        secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if secret_header != WEBHOOK_SECRET:
+            return "Unauthorized", 403
+
     json_data = request.get_json(force=True)
-    
-    # 2. Parse the update using the bot instance safely inside the function
     update = Update.de_json(json_data, application.bot)
     
-    # 3. Process the update asynchronously (required for python-telegram-bot v20+)
     if update:
         asyncio.run_coroutine_threadsafe(
             application.process_update(update), 
-            application.updater.bot.loop if hasattr(application, 'updater') and application.updater else asyncio.get_event_loop()
+            _loop
         )
         
     return "OK", 200
