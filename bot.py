@@ -1,2186 +1,1562 @@
 import os
+import logging
+import time
 import sqlite3
 import asyncio
-import threading
-import time
-import logging
-from typing import Optional
-
-import requests
+from datetime import datetime
+from threading import Thread
 import pulp
-
-from flask import Flask, request, jsonify
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-
-WEBHOOK_URL = os.getenv(
-    "WEBHOOK_URL",
-    "https://your-render-app.onrender.com/webhook"
-)
-
-WEBHOOK_SECRET = os.getenv(
-    "WEBHOOK_SECRET",
-    ""
-)
-
-PORT = int(os.getenv("PORT", "5000"))
-
-FPL_CACHE_SECONDS = 300
-
-DATABASE = "fpl_bot.db"
-
-
-# ============================================================
-# LOGGING
-# ============================================================
+import requests
+from flask import Flask
+from telegram import Update, BotCommand
+from telegram.ext import Application, CommandHandler
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-
 logger = logging.getLogger(__name__)
 
+# --- Reliability notes ---
+# 1. /live now simulates FPL's automatic substitutions and the captain -> vice-captain
+#    fallback, so the total matches the official score even when a starter blanks.
+# 2. Per-manager endpoints (profile, picks, history, live) are now briefly cached
+#    (see CACHE_TTL_* on FPLBot) so back-to-back commands don't double-hit the FPL API.
+# 3. All outbound FPL API calls retry with backoff on timeouts/connection errors/5xx;
+#    4xx (e.g. a bad team ID) still fails fast, same as before.
+# 4. SQLite reads/writes run via asyncio.to_thread so one chat's DB call can't stall
+#    every other chat's handler.
 
-# ============================================================
-# FLASK
-# ============================================================
-
+# --- Flask Server Setup for Render Health Checks ---
 app = Flask(__name__)
 
+@app.route('/')
+def health_check():
+    return "FPL Bot is active and healthy!", 200
 
-# ============================================================
-# TELEGRAM APPLICATION
-# ============================================================
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+# --------------------------------------------------
 
-if not TOKEN:
-    logger.warning(
-        "TELEGRAM_BOT_TOKEN is not configured."
-    )
-
-application = (
-    Application.builder()
-    .token(TOKEN if TOKEN else "000000:INVALID")
-    .updater(None)
-    .build()
-)
-
-ptb_loop = None
-ptb_thread = None
-
-
-# ============================================================
-# DATABASE
-# ============================================================
-
-def get_db():
-    return sqlite3.connect(
-        DATABASE,
-        timeout=30,
-        check_same_thread=False
-    )
-
-
-def init_db():
-
-    conn = get_db()
-
-    try:
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS user_teams (
-                chat_id INTEGER PRIMARY KEY,
-                team_id INTEGER NOT NULL
-            )
-        """)
-
-        conn.commit()
-
-    finally:
-        conn.close()
-
-
-def save_team_id(chat_id, team_id):
-
-    conn = get_db()
-
-    try:
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            INSERT INTO user_teams(chat_id, team_id)
-            VALUES (?, ?)
-            ON CONFLICT(chat_id)
-            DO UPDATE SET team_id = excluded.team_id
-        """, (chat_id, team_id))
-
-        conn.commit()
-
-    finally:
-        conn.close()
-
-
-def get_team_id(chat_id):
-
-    conn = get_db()
-
-    try:
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            SELECT team_id
-            FROM user_teams
-            WHERE chat_id = ?
-        """, (chat_id,))
-
-        row = cursor.fetchone()
-
-        return row[0] if row else None
-
-    finally:
-        conn.close()
-
-
-def get_all_user_teams():
-
-    conn = get_db()
-
-    try:
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            SELECT chat_id, team_id
-            FROM user_teams
-        """)
-
-        return cursor.fetchall()
-
-    finally:
-        conn.close()
-
-
-init_db()
-
-
-# ============================================================
-# FPL API
-# ============================================================
-
-FPL_BASE = "https://fantasy.premierleague.com/api"
-
-_cache = {
-    "bootstrap": None,
-    "fixtures": None,
-    "timestamp": 0,
+FPL_BASE_URL = "https://fantasy.premierleague.com/api/"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://fantasy.premierleague.com/"
 }
 
-_cache_lock = threading.Lock()
+POS_NAME = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
 
 
-def fpl_get(endpoint):
+class DatabaseManager:
+    def __init__(self, db_path="fpl_bot.db"):
+        self.db_path = db_path
+        self._init_db()
 
-    url = f"{FPL_BASE}/{endpoint.lstrip('/')}"
-
-    try:
-
-        response = requests.get(
-            url,
-            timeout=20,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 "
-                    "(compatible; FPL-Tactical-Assistant/3.0)"
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    chat_id INTEGER PRIMARY KEY,
+                    team_id TEXT NOT NULL
                 )
-            }
-        )
+            """)
+            conn.commit()
 
-        response.raise_for_status()
+    def _get_team_id_sync(self, chat_id):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT team_id FROM users WHERE chat_id = ?", (chat_id,))
+            row = cursor.fetchone()
+            return row[0] if row else None
 
-        return response.json()
+    async def get_team_id(self, chat_id):
+        # Off-loaded to a thread so one chat's DB read never blocks the event loop
+        # (and therefore every other chat's in-flight command) on sqlite I/O.
+        return await asyncio.to_thread(self._get_team_id_sync, chat_id)
 
-    except requests.RequestException as exc:
+    def _set_team_id_sync(self, chat_id, team_id):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO users (chat_id, team_id) VALUES (?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET team_id = ?
+            """, (chat_id, team_id, team_id))
+            conn.commit()
 
-        logger.error(
-            "FPL request failed: %s",
-            exc
-        )
+    async def set_team_id(self, chat_id, team_id):
+        await asyncio.to_thread(self._set_team_id_sync, chat_id, team_id)
 
+
+class FPLBot:
+    CACHE_TTL_STATIC = 300   # bootstrap-static / fixtures -- unchanged from before
+    CACHE_TTL_MANAGER = 60   # manager profile & history -- doesn't move fast
+    CACHE_TTL_PICKS = 60     # per-manager GW picks
+    CACHE_TTL_LIVE = 20      # live event stats -- short, since scores move during play
+    MAX_RETRIES = 3
+    RETRY_BACKOFF_BASE = 0.6  # seconds; doubles each retry (0.6, 1.2, ...)
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+        self.db = DatabaseManager()
+        self._cache = {}
+
+    # --- Networking: retry/backoff + a single cache path for every FPL endpoint ---
+    def _request_with_retry(self, url):
+        """Synchronous GET with retry/backoff for transient failures (timeouts,
+        connection errors, 5xx). 4xx errors (e.g. an invalid team ID -> 404) fail
+        fast since retrying can't change the outcome."""
+        last_exc = None
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                res = self.session.get(url, timeout=15)
+                if res.status_code >= 500:
+                    raise requests.exceptions.HTTPError(f"Server error {res.status_code}", response=res)
+                res.raise_for_status()
+                return res.json()
+            except requests.exceptions.HTTPError as e:
+                resp = getattr(e, "response", None)
+                if resp is not None and resp.status_code < 500:
+                    logger.error(f"Non-retryable HTTP error for {url}: {e}")
+                    return None
+                last_exc = e
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                last_exc = e
+            except Exception as e:
+                logger.error(f"Unexpected error fetching {url}: {e}")
+                return None
+
+            if attempt < self.MAX_RETRIES - 1:
+                time.sleep(self.RETRY_BACKOFF_BASE * (2 ** attempt))
+
+        logger.error(f"Request failed after {self.MAX_RETRIES} attempts: {url} ({last_exc})")
         return None
 
-    except ValueError as exc:
+    async def _cached_get(self, cache_key, url, ttl):
+        now = time.time()
+        cached = self._cache.get(cache_key)
+        if cached and (now - cached["time"] < ttl):
+            return cached["data"]
+        data = await asyncio.to_thread(self._request_with_retry, url)
+        if data is not None:
+            self._cache[cache_key] = {"data": data, "time": now}
+        return data
 
-        logger.error(
-            "Invalid FPL JSON: %s",
-            exc
+    async def _fetch_bootstrap_static(self):
+        return await self._cached_get("bootstrap", f"{FPL_BASE_URL}bootstrap-static/", self.CACHE_TTL_STATIC)
+
+    async def _fetch_fixtures(self):
+        return await self._cached_get("fixtures", f"{FPL_BASE_URL}fixtures/", self.CACHE_TTL_STATIC)
+
+    async def _fetch_manager_data(self, team_id):
+        return await self._cached_get(f"manager:{team_id}", f"{FPL_BASE_URL}entry/{team_id}/", self.CACHE_TTL_MANAGER)
+
+    async def _fetch_manager_gw_picks(self, team_id, gw):
+        return await self._cached_get(
+            f"picks:{team_id}:{gw}", f"{FPL_BASE_URL}entry/{team_id}/event/{gw}/picks/", self.CACHE_TTL_PICKS
         )
 
-        return None
-
-
-def get_fpl_data(force_refresh=False):
-
-    now = time.time()
-
-    with _cache_lock:
-
-        if (
-            not force_refresh
-            and _cache["bootstrap"] is not None
-            and _cache["fixtures"] is not None
-            and now - _cache["timestamp"]
-            < FPL_CACHE_SECONDS
-        ):
-            return (
-                _cache["bootstrap"],
-                _cache["fixtures"]
-            )
-
-    bootstrap = fpl_get(
-        "/bootstrap-static/"
-    )
-
-    fixtures = fpl_get(
-        "/fixtures/"
-    )
-
-    if bootstrap is None or fixtures is None:
-
-        return None, None
-
-    with _cache_lock:
-
-        _cache["bootstrap"] = bootstrap
-        _cache["fixtures"] = fixtures
-        _cache["timestamp"] = now
-
-    return bootstrap, fixtures
-
-
-def get_current_gameweek(bootstrap):
-
-    events = bootstrap.get(
-        "events",
-        []
-    )
-
-    current = next(
-        (
-            gw["id"]
-            for gw in events
-            if gw.get("is_current")
-        ),
-        None
-    )
-
-    if current:
-        return current
-
-    upcoming = next(
-        (
-            gw["id"]
-            for gw in events
-            if gw.get("is_next")
-        ),
-        None
-    )
-
-    if upcoming:
-        return upcoming
-
-    return 1
-
-
-def fetch_user_entry(team_id):
-
-    return fpl_get(
-        f"/entry/{team_id}/"
-    )
-
-
-def fetch_user_picks(team_id):
-
-    bootstrap, _ = get_fpl_data()
-
-    if not bootstrap:
-        return None, None
-
-    gameweek = get_current_gameweek(
-        bootstrap
-    )
-
-    picks = fpl_get(
-        f"/entry/{team_id}/event/{gameweek}/picks/"
-    )
-
-    if not picks:
-
-        # During an off-week, try the next gameweek.
-        events = bootstrap.get(
-            "events",
-            []
-        )
-
-        next_gw = next(
-            (
-                gw["id"]
-                for gw in events
-                if gw.get("is_next")
-            ),
-            gameweek
-        )
-
-        if next_gw != gameweek:
-
-            picks = fpl_get(
-                f"/entry/{team_id}/event/{next_gw}/picks/"
-            )
-
-            if picks:
-                return picks, next_gw
-
-        return None, gameweek
-
-    return picks, gameweek
-
-
-def fetch_live_gameweek(gameweek):
-
-    return fpl_get(
-        f"/event/{gameweek}/live/"
-    )
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-POSITION_NAMES = {
-    1: "GKP",
-    2: "DEF",
-    3: "MID",
-    4: "FWD",
-}
-
-
-def player_name(player):
-
-    return player.get(
-        "web_name",
-        "Unknown"
-    )
-
-
-def player_price(player):
-
-    return safe_float(
-        player.get("now_cost"),
-        0
-    ) / 10
-
-
-def safe_float(value, default=0):
-
-    try:
-        return float(value)
-
-    except (
-        TypeError,
-        ValueError
-    ):
-        return default
-
-
-def player_expected_points(player):
-
-    return safe_float(
-        player.get("ep_next"),
-        0
-    )
-
-
-def player_fit(player):
-
-    chance = player.get(
-        "chance_of_playing_next_round"
-    )
-
-    if chance is None:
-        return True
-
-    return safe_float(chance) > 0
-
-
-def minutes_probability(player):
-
-    chance = player.get(
-        "chance_of_playing_next_round"
-    )
-
-    if chance is not None:
-
-        return max(
-            0,
-            min(
-                safe_float(chance, 100),
-                100
-            )
-        ) / 100
-
-    minutes = safe_float(
-        player.get("minutes"),
-        0
-    )
-
-    starts = safe_float(
-        player.get("starts"),
-        0
-    )
-
-    if minutes <= 0:
-        return 0.75
-
-    expected_90s = max(
-        minutes / 90,
-        1
-    )
-
-    start_rate = (
-        starts / expected_90s
-    )
-
-    return max(
-        0.55,
-        min(
-            start_rate,
-            1.0
-        )
-    )
-
-
-def get_team_name(
-    bootstrap,
-    team_id
-):
-
-    team = next(
-        (
-            t
-            for t in bootstrap.get("teams", [])
-            if t["id"] == team_id
-        ),
-        None
-    )
-
-    return (
-        team["name"]
-        if team
-        else "Unknown"
-    )
-
-
-def opponent_name(
-    bootstrap,
-    fixture,
-    team_id
-):
-
-    if fixture.get("team_h") == team_id:
-
-        opponent_id = fixture.get(
-            "team_a"
-        )
-
-    else:
-
-        opponent_id = fixture.get(
-            "team_h"
-        )
-
-    return get_team_name(
-        bootstrap,
-        opponent_id
-    )
-
-
-def fixture_label(
-    bootstrap,
-    fixture,
-    team_id
-):
-
-    home = (
-        fixture.get("team_h")
-        == team_id
-    )
-
-    opponent = opponent_name(
-        bootstrap,
-        fixture,
-        team_id
-    )
-
-    return (
-        f"{opponent} "
-        f"({'H' if home else 'A'})"
-    )
-
-
-def fixture_difficulty(
-    fixture,
-    team_id
-):
-
-    if fixture.get("team_h") == team_id:
-
-        return safe_float(
-            fixture.get(
-                "team_h_difficulty",
-                3
-            ),
-            3
-        )
-
-    return safe_float(
-        fixture.get(
-            "team_a_difficulty",
-            3
-        ),
-        3
-    )
-
-
-def get_upcoming_fixtures(
-    bootstrap,
-    fixtures,
-    team_id,
-    limit=3
-):
-
-    upcoming = []
-
-    for fixture in fixtures:
-
-        if fixture.get("finished"):
-            continue
-
-        if (
-            fixture.get("team_h") != team_id
-            and
-            fixture.get("team_a") != team_id
-        ):
-            continue
-
-        upcoming.append(
-            fixture
-        )
-
-    upcoming.sort(
-        key=lambda f: (
-            f.get("event") is None,
-            f.get("event") or 999
-        )
-    )
-
-    return upcoming[:limit]
-
-
-# ============================================================
-# PREDICTION ENGINE
-# ============================================================
-
-def calculate_fixture_score(
-    bootstrap,
-    fixtures,
-    player,
-    gameweeks=1
-):
-
-    upcoming = get_upcoming_fixtures(
-        bootstrap,
-        fixtures,
-        player["team"],
-        limit=gameweeks
-    )
-
-    if not upcoming:
-        return 1.0
-
-    score = 0
-
-    for fixture in upcoming:
-
-        fdr = fixture_difficulty(
-            fixture,
-            player["team"]
-        )
-
-        difficulty_factor = (
-            1.25
-            - ((fdr - 1) * 0.12)
-        )
-
-        difficulty_factor = max(
-            0.65,
-            min(
-                difficulty_factor,
-                1.25
-            )
-        )
-
-        score += difficulty_factor
-
-    return score / len(upcoming)
-
-
-def player_prediction_score(
-    bootstrap,
-    fixtures,
-    player,
-    gameweeks=1
-):
-
-    ep = player_expected_points(
-        player
-    )
-
-    form = safe_float(
-        player.get("form"),
-        0
-    )
-
-    ppg = safe_float(
-        player.get("points_per_game"),
-        0
-    )
-
-    xgi = safe_float(
-        player.get(
-            "expected_goal_involvements"
-        ),
-        0
-    )
-
-    threat = safe_float(
-        player.get("threat"),
-        0
-    )
-
-    creativity = safe_float(
-        player.get("creativity"),
-        0
-    )
-
-    influence = safe_float(
-        player.get("influence"),
-        0
-    )
-
-    minutes = minutes_probability(
-        player
-    )
-
-    fixture_score = calculate_fixture_score(
-        bootstrap,
-        fixtures,
-        player,
-        gameweeks
-    )
-
-    xgi_component = min(
-        xgi * 0.45,
-        2.5
-    )
-
-    form_component = min(
-        form * 0.25,
-        2.5
-    )
-
-    ppg_component = min(
-        ppg * 0.25,
-        2.5
-    )
-
-    threat_component = min(
-        threat / 100,
-        2.0
-    )
-
-    creativity_component = min(
-        creativity / 100,
-        1.5
-    )
-
-    influence_component = min(
-        influence / 100,
-        1.5
-    )
-
-    raw_score = (
-        ep * 0.40
-        + form_component
-        + ppg_component
-        + xgi_component
-        + threat_component
-        + creativity_component
-        + influence_component
-    )
-
-    raw_score *= (
-        0.65
-        + (minutes * 0.35)
-    )
-
-    raw_score *= fixture_score
-
-    return round(
-        raw_score,
-        3
-    )
-
-
-def prediction_explanation(
-    bootstrap,
-    fixtures,
-    player
-):
-
-    return {
-        "score": player_prediction_score(
-            bootstrap,
-            fixtures,
-            player
-        ),
-        "ep": player_expected_points(
-            player
-        ),
-        "form": safe_float(
-            player.get("form")
-        ),
-        "ppg": safe_float(
-            player.get("points_per_game")
-        ),
-        "xgi": safe_float(
-            player.get(
-                "expected_goal_involvements"
-            )
-        ),
-    }
-
-
-# ============================================================
-# STARTING XI OPTIMIZER
-# ============================================================
-
-def optimize_starting_xi(
-    bootstrap,
-    fixtures,
-    user_picks
-):
-
-    players_map = {
-        p["id"]: p
-        for p in bootstrap["elements"]
-    }
-
-    squad = []
-
-    for pick in user_picks:
-
-        player = players_map.get(
-            pick["element"]
-        )
-
-        if not player:
-            continue
-
-        prediction = player_prediction_score(
-            bootstrap,
-            fixtures,
-            player
-        )
-
-        squad.append(
-            {
-                "id": player["id"],
-                "name": player_name(player),
-                "element_type": player["element_type"],
-                "ep": player_expected_points(player),
-                "prediction": prediction,
-                "multiplier": pick.get(
-                    "multiplier",
-                    0
-                ),
-                "is_captain": pick.get(
-                    "is_captain",
-                    False
-                ),
-                "is_vice": pick.get(
-                    "is_vice",
-                    False
-                ),
-            }
-        )
-
-    if len(squad) < 15:
-
-        raise ValueError(
-            "FPL returned fewer than 15 players."
-        )
-
-    problem = pulp.LpProblem(
-        "FPL_Starting_XI",
-        pulp.LpMaximize
-    )
-
-    x = {
-        p["id"]: pulp.LpVariable(
-            f"starter_{p['id']}",
-            cat="Binary"
-        )
-        for p in squad
-    }
-
-    problem += pulp.lpSum(
-        p["prediction"] * x[p["id"]]
-        for p in squad
-    )
-
-    problem += pulp.lpSum(
-        x[p["id"]]
-        for p in squad
-    ) == 11
-
-    # Goalkeeper
-    problem += pulp.lpSum(
-        x[p["id"]]
-        for p in squad
-        if p["element_type"] == 1
-    ) == 1
-
-    # Defenders
-    problem += pulp.lpSum(
-        x[p["id"]]
-        for p in squad
-        if p["element_type"] == 2
-    ) >= 3
-
-    problem += pulp.lpSum(
-        x[p["id"]]
-        for p in squad
-        if p["element_type"] == 2
-    ) <= 5
-
-    # Midfielders
-    problem += pulp.lpSum(
-        x[p["id"]]
-        for p in squad
-        if p["element_type"] == 3
-    ) >= 2
-
-    problem += pulp.lpSum(
-        x[p["id"]]
-        for p in squad
-        if p["element_type"] == 3
-    ) <= 5
-
-    # Forwards
-    problem += pulp.lpSum(
-        x[p["id"]]
-        for p in squad
-        if p["element_type"] == 4
-    ) >= 1
-
-    problem += pulp.lpSum(
-        x[p["id"]]
-        for p in squad
-        if p["element_type"] == 4
-    ) <= 3
-
-    status = problem.solve(
-        pulp.PULP_CBC_CMD(
-            msg=False
-        )
-    )
-
-    if status != pulp.LpStatusOptimal:
-
-        raise ValueError(
-            "Unable to optimize XI."
-        )
-
-    starters = [
-        p
-        for p in squad
-        if x[p["id"]].value() == 1
-    ]
-
-    bench = [
-        p
-        for p in squad
-        if x[p["id"]].value() != 1
-    ]
-
-    bench.sort(
-        key=lambda p: p["prediction"],
-        reverse=True
-    )
-
-    captain = max(
-        starters,
-        key=lambda p: p["prediction"]
-    )
-
-    vice_candidates = [
-        p
-        for p in starters
-        if p["id"] != captain["id"]
-    ]
-
-    vice = max(
-        vice_candidates,
-        key=lambda p: p["prediction"]
-    )
-
-    return (
-        starters,
-        bench,
-        captain,
-        vice
-    )
-
-
-# ============================================================
-# FREE HIT OPTIMIZER
-# ============================================================
-
-def optimize_free_hit(
-    bootstrap,
-    fixtures
-):
-
-    players = [
-        p
-        for p in bootstrap["elements"]
-        if player_fit(p)
-    ]
-
-    problem = pulp.LpProblem(
-        "FPL_Free_Hit",
-        pulp.LpMaximize
-    )
-
-    x = {
-        p["id"]: pulp.LpVariable(
-            f"fh_{p['id']}",
-            cat="Binary"
-        )
-        for p in players
-    }
-
-    problem += pulp.lpSum(
-        player_prediction_score(
-            bootstrap,
-            fixtures,
-            p
-        ) * x[p["id"]]
-        for p in players
-    )
-
-    problem += pulp.lpSum(
-        x[p["id"]]
-        for p in players
-    ) == 15
-
-    problem += pulp.lpSum(
-        p["now_cost"] * x[p["id"]]
-        for p in players
-    ) <= 1000
-
-    problem += pulp.lpSum(
-        x[p["id"]]
-        for p in players
-        if p["element_type"] == 1
-    ) == 2
-
-    problem += pulp.lpSum(
-        x[p["id"]]
-        for p in players
-        if p["element_type"] == 2
-    ) == 5
-
-    problem += pulp.lpSum(
-        x[p["id"]]
-        for p in players
-        if p["element_type"] == 3
-    ) == 5
-
-    problem += pulp.lpSum(
-        x[p["id"]]
-        for p in players
-        if p["element_type"] == 4
-    ) == 3
-
-    # Maximum 3 players from one club.
-    for team in bootstrap.get("teams", []):
-
-        problem += pulp.lpSum(
-            x[p["id"]]
-            for p in players
-            if p["team"] == team["id"]
-        ) <= 3
-
-    status = problem.solve(
-        pulp.PULP_CBC_CMD(
-            msg=False
-        )
-    )
-
-    if status != pulp.LpStatusOptimal:
-
-        return None
-
-    selected = [
-        p
-        for p in players
-        if x[p["id"]].value() == 1
-    ]
-
-    selected.sort(
-        key=lambda p: (
-            p["element_type"],
-            -player_prediction_score(
-                bootstrap,
-                fixtures,
-                p
-            )
-        )
-    )
-
-    return selected
-
-
-# ============================================================
-# TRANSFER VALIDATION
-# ============================================================
-
-def squad_team_count(
-    squad_players
-):
-
-    counts = {}
-
-    for player in squad_players:
-
-        team = player["team"]
-
-        counts[team] = (
-            counts.get(team, 0)
-            + 1
-        )
-
-    return counts
-
-
-def valid_transfer_team(
-    squad_players,
-    outgoing,
-    incoming
-):
-
-    new_squad = [
-        p
-        for p in squad_players
-        if p["id"] != outgoing["id"]
-    ]
-
-    new_squad.append(
-        incoming
-    )
-
-    counts = squad_team_count(
-        new_squad
-    )
-
-    return all(
-        count <= 3
-        for count in counts.values()
-    )
-
-
-# ============================================================
-# TRANSFER RECOMMENDATIONS
-# ============================================================
-
-def find_transfer_recommendations(
-    bootstrap,
-    fixtures,
-    team_id,
-    max_results=5
-):
-
-    entry = fetch_user_entry(
-        team_id
-    )
-
-    picks_data, gameweek = fetch_user_picks(
-        team_id
-    )
-
-    if not entry or not picks_data:
-
-        return [], None, gameweek
-
-    bank = (
-        safe_float(
-            entry.get(
-                "last_deadline_bank",
-                0
-            )
-        ) / 10
-    )
-
-    if bank < 0:
-        bank = 0
-
-    players_map = {
-        p["id"]: p
-        for p in bootstrap["elements"]
-    }
-
-    squad = []
-
-    for pick in picks_data.get(
-        "picks",
-        []
-    ):
-
-        player = players_map.get(
-            pick["element"]
-        )
-
-        if player:
-
-            squad.append(
-                player
-            )
-
-    if len(squad) != 15:
-
-        return [], None, gameweek
-
-    squad_ids = {
-        p["id"]
-        for p in squad
-    }
-
-    recommendations = []
-
-    for outgoing in squad:
-
-        outgoing_score = player_prediction_score(
-            bootstrap,
-            fixtures,
-            outgoing,
-            gameweeks=2
-        )
-
-        for incoming in bootstrap["elements"]:
-
-            if incoming["id"] in squad_ids:
-                continue
-
-            if not player_fit(incoming):
-                continue
-
-            if (
-                incoming["element_type"]
-                != outgoing["element_type"]
-            ):
-                continue
-
-            price_difference = (
-                incoming["now_cost"]
-                - outgoing["now_cost"]
-            ) / 10
-
-            if price_difference > bank:
-                continue
-
-            if not valid_transfer_team(
-                squad,
-                outgoing,
-                incoming
-            ):
-                continue
-
-            incoming_score = player_prediction_score(
-                bootstrap,
-                fixtures,
-                incoming,
-                gameweeks=2
-            )
-
-            gain = (
-                incoming_score
-                - outgoing_score
-            )
-
-            if gain <= 0:
-                continue
-
-            recommendations.append(
-                {
-                    "out": outgoing,
-                    "in": incoming,
-                    "out_score": outgoing_score,
-                    "in_score": incoming_score,
-                    "gain": gain,
-                    "price_difference": price_difference,
-                }
-            )
-
-    recommendations.sort(
-        key=lambda r: r["gain"],
-        reverse=True
-    )
-
-    return (
-        recommendations[:max_results],
-        entry,
-        gameweek
-    )
-
-
-# ============================================================
-# FORMATTING
-# ============================================================
-
-def format_player(
-    player,
-    bootstrap=None
-):
-
-    position = POSITION_NAMES.get(
-        player.get("element_type"),
-        "?"
-    )
-
-    price = player_price(
-        player
-    )
-
-    return (
-        f"{player_name(player)} "
-        f"({position}, £{price:.1f}m)"
-    )
-
-
-def format_prediction_player(
-    player,
-    bootstrap,
-    fixtures
-):
-
-    score = player_prediction_score(
-        bootstrap,
-        fixtures,
-        player
-    )
-
-    ep = player_expected_points(
-        player
-    )
-
-    return (
-        f"{player_name(player)} "
-        f"— prediction {score:.2f} "
-        f"| EP {ep:.1f}"
-    )
-
-
-def format_fixture_list(
-    bootstrap,
-    fixtures,
-    team_id,
-    limit=3
-):
-
-    upcoming = get_upcoming_fixtures(
-        bootstrap,
-        fixtures,
-        team_id,
-        limit=limit
-    )
-
-    if not upcoming:
-        return "No upcoming fixtures found."
-
-    return ", ".join(
-        fixture_label(
-            bootstrap,
-            fixture,
-            team_id
-        )
-        for fixture in upcoming
-    )
-
-
-# ============================================================
-# TELEGRAM COMMANDS
-# ============================================================
-
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = update.effective_message
-
-    if not message:
-        return
-
-    await message.reply_text(
-        "⚽ FPL Tactical Assistant\n\n"
-        "Commands:\n"
-        "/team YOUR_FPL_TEAM_ID - save your team\n"
-        "/myteam - show saved team\n"
-        "/xi - optimize your starting XI\n"
-        "/freehit - build a Free Hit squad\n"
-        "/transfers - find transfer targets\n"
-        "/help - show commands\n\n"
-        "Example:\n"
-        "/team 1234567"
-    )
-
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.effective_message.reply_text(
-        "⚽ FPL Tactical Assistant\n\n"
-        "/team ID — save your FPL team ID\n"
-        "/myteam — show saved team ID\n"
-        "/xi — optimize your starting XI\n"
-        "/freehit — optimize a Free Hit squad\n"
-        "/transfers — find transfer recommendations\n"
-        "/help — show this message"
-    )
-
-
-async def team_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = update.effective_message
-
-    if not message:
-        return
-
-    if not context.args:
-
-        await message.reply_text(
-            "Please provide your FPL team ID.\n\n"
-            "Example:\n"
-            "/team 1234567"
-        )
-
-        return
-
-    try:
-
-        team_id = int(
-            context.args[0]
-        )
-
-        if team_id <= 0:
-
-            raise ValueError
-
-    except ValueError:
-
-        await message.reply_text(
-            "❌ Invalid team ID.\n"
-            "Use numbers only.\n\n"
-            "Example: /team 1234567"
-        )
-
-        return
-
-    entry = fetch_user_entry(
-        team_id
-    )
-
-    if not entry:
-
-        await message.reply_text(
-            "❌ I couldn't find that FPL team.\n"
-            "Check your team ID and try again."
-        )
-
-        return
-
-    chat_id = update.effective_chat.id
-
-    save_team_id(
-        chat_id,
-        team_id
-    )
-
-    manager = entry.get(
-        "player_name",
-        "Unknown"
-    )
-
-    team_name = entry.get(
-        "name",
-        "Unnamed Team"
-    )
-
-    await message.reply_text(
-        "✅ FPL team saved.\n\n"
-        f"Team: {team_name}\n"
-        f"Manager: {manager}\n"
-        f"Team ID: {team_id}\n\n"
-        "Use /xi to optimize your XI."
-    )
-
-
-async def myteam_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    chat_id = update.effective_chat.id
-
-    team_id = get_team_id(
-        chat_id
-    )
-
-    if not team_id:
-
-        await update.effective_message.reply_text(
-            "You haven't saved an FPL team yet.\n\n"
-            "Use:\n"
-            "/team YOUR_TEAM_ID"
-        )
-
-        return
-
-    entry = fetch_user_entry(
-        team_id
-    )
-
-    if not entry:
-
-        await update.effective_message.reply_text(
-            f"Saved team ID: {team_id}\n"
-            "However, FPL could not be reached right now."
-        )
-
-        return
-
-    await update.effective_message.reply_text(
-        "⚽ Your FPL team\n\n"
-        f"Team: {entry.get('name', 'Unknown')}\n"
-        f"Manager: {entry.get('player_name', 'Unknown')}\n"
-        f"Team ID: {team_id}\n"
-        f"Overall rank: "
-        f"{entry.get('summary_overall_rank', 'N/A')}"
-    )
-
-
-async def xi_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = update.effective_message
-
-    chat_id = update.effective_chat.id
-
-    team_id = get_team_id(
-        chat_id
-    )
-
-    if not team_id:
-
-        await message.reply_text(
-            "❌ Save your FPL team first.\n\n"
-            "Use:\n"
-            "/team YOUR_TEAM_ID"
-        )
-
-        return
-
-    await message.reply_text(
-        "🔎 Analyzing your squad..."
-    )
-
-    bootstrap, fixtures = get_fpl_data(
-        force_refresh=True
-    )
-
-    if not bootstrap or not fixtures:
-
-        await message.reply_text(
-            "❌ FPL data is temporarily unavailable."
-        )
-
-        return
-
-    picks_data, gameweek = fetch_user_picks(
-        team_id
-    )
-
-    if not picks_data:
-
-        await message.reply_text(
-            "❌ I couldn't retrieve your squad."
-        )
-
-        return
-
-    try:
-
-        starters, bench, captain, vice = (
-            optimize_starting_xi(
-                bootstrap,
-                fixtures,
-                picks_data["picks"]
-            )
-        )
-
-    except Exception as exc:
-
-        logger.exception(
-            "XI optimization failed"
-        )
-
-        await message.reply_text(
-            f"❌ XI optimization failed:\n{exc}"
-        )
-
-        return
-
-    position_order = {
-        1: 0,
-        2: 1,
-        3: 2,
-        4: 3,
-    }
-
-    starters.sort(
-        key=lambda p: (
-            position_order.get(
-                p["element_type"],
-                9
-            ),
-            -p["prediction"]
-        )
-    )
-
-    lines = [
-        f"⚽ OPTIMIZED XI — GW{gameweek}",
-        "",
-    ]
-
-    for player in starters:
-
-        marker = ""
-
-        if player["id"] == captain["id"]:
-            marker = " ©"
-
-        elif player["id"] == vice["id"]:
-            marker = " (VC)"
-
-        lines.append(
-            f"• {player['name']}{marker} "
-            f"[{POSITION_NAMES.get(player['element_type'], '?')}] "
-            f"{player['prediction']:.2f}"
-        )
-
-    lines.extend(
-        [
-            "",
-            f"© Captain: {captain['name']}",
-            f"VC: {vice['name']}",
-            "",
-            "🪑 BENCH",
-        ]
-    )
-
-    for index, player in enumerate(
-        bench,
-        start=1
-    ):
-
-        lines.append(
-            f"{index}. {player['name']} "
-            f"[{POSITION_NAMES.get(player['element_type'], '?')}] "
-            f"{player['prediction']:.2f}"
-        )
-
-    await message.reply_text(
-        "\n".join(lines)
-    )
-
-
-async def freehit_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = update.effective_message
-
-    await message.reply_text(
-        "🔎 Building the best Free Hit squad..."
-    )
-
-    bootstrap, fixtures = get_fpl_data(
-        force_refresh=True
-    )
-
-    if not bootstrap or not fixtures:
-
-        await message.reply_text(
-            "❌ FPL data is temporarily unavailable."
-        )
-
-        return
-
-    try:
-
-        selected = optimize_free_hit(
-            bootstrap,
-            fixtures
-        )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Free Hit optimization failed"
-        )
-
-        await message.reply_text(
-            f"❌ Free Hit optimization failed:\n{exc}"
-        )
-
-        return
-
-    if not selected:
-
-        await message.reply_text(
-            "❌ Unable to create a Free Hit squad."
-        )
-
-        return
-
-    total_cost = sum(
-        p["now_cost"]
-        for p in selected
-    ) / 10
-
-    lines = [
-        "🔥 FREE HIT SQUAD",
-        "",
-        f"Budget used: £{total_cost:.1f}m",
-        "",
-    ]
-
-    for position in [1, 2, 3, 4]:
-
-        position_players = [
-            p
-            for p in selected
-            if p["element_type"] == position
-        ]
-
-        if not position_players:
-            continue
-
-        lines.append(
-            POSITION_NAMES[position] + ":"
-        )
-
-        for player in position_players:
-
-            prediction = player_prediction_score(
-                bootstrap,
-                fixtures,
-                player
-            )
-
-            lines.append(
-                f"• {player_name(player)} "
-                f"— £{player_price(player):.1f}m "
-                f"— {prediction:.2f}"
-            )
-
-        lines.append("")
-
-    await message.reply_text(
-        "\n".join(lines)
-    )
-
-
-async def transfers_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = update.effective_message
-
-    chat_id = update.effective_chat.id
-
-    team_id = get_team_id(
-        chat_id
-    )
-
-    if not team_id:
-
-        await message.reply_text(
-            "❌ Save your FPL team first.\n\n"
-            "Use:\n"
-            "/team YOUR_TEAM_ID"
-        )
-
-        return
-
-    await message.reply_text(
-        "🔎 Searching for transfer improvements..."
-    )
-
-    bootstrap, fixtures = get_fpl_data(
-        force_refresh=True
-    )
-
-    if not bootstrap or not fixtures:
-
-        await message.reply_text(
-            "❌ FPL data is temporarily unavailable."
-        )
-
-        return
-
-    try:
-
-        recommendations, entry, gameweek = (
-            find_transfer_recommendations(
-                bootstrap,
-                fixtures,
-                team_id,
-                max_results=5
-            )
-        )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Transfer engine failed"
-        )
-
-        await message.reply_text(
-            f"❌ Transfer analysis failed:\n{exc}"
-        )
-
-        return
-
-    if not recommendations:
-
-        await message.reply_text(
-            "No positive transfer improvements "
-            "were found with the current squad/budget."
-        )
-
-        return
-
-    lines = [
-        f"🔄 TRANSFER TARGETS — GW{gameweek}",
-        "",
-    ]
-
-    for index, rec in enumerate(
-        recommendations,
-        start=1
-    ):
-
-        outgoing = rec["out"]
-        incoming = rec["in"]
-
-        difference = rec[
-            "price_difference"
-        ]
-
-        if difference >= 0:
-
-            price_text = (
-                f"+£{difference:.1f}m"
-            )
-
+    async def _fetch_manager_history(self, team_id):
+        return await self._cached_get(f"history:{team_id}", f"{FPL_BASE_URL}entry/{team_id}/history/", self.CACHE_TTL_MANAGER)
+
+    async def _fetch_live_event(self, gw):
+        return await self._cached_get(f"live:{gw}", f"{FPL_BASE_URL}event/{gw}/live/", self.CACHE_TTL_LIVE)
+
+    @staticmethod
+    def _fmt_rank(val):
+        return f"{val:,}" if isinstance(val, int) else "—"
+
+    def _estimate_free_transfers(self, history_data, upto_event):
+        """Reconstruct banked free transfers heading into the gameweek after `upto_event`,
+        using FPL's accrual rules: +1 FT per gameweek (capped at 5), and Wildcard/Free Hit
+        weeks don't touch the bank since they grant unlimited free transfers that week.
+        Falls back to 1 (the safe default most managers are near) if history is unavailable."""
+        if not history_data or 'current' not in history_data:
+            return 1
+
+        chip_events = {c['event']: c['name'] for c in history_data.get('chips', [])}
+        ft = 1
+        for row in sorted(history_data['current'], key=lambda r: r['event']):
+            event = row['event']
+            if event > upto_event:
+                break
+            transfers_made = row.get('event_transfers', 0) or 0
+            if chip_events.get(event) in ('wildcard', 'freehit'):
+                transfers_made = 0
+            if event > 1:
+                ft = min(ft + 1, 5)
+            ft = max(0, ft - transfers_made)
+        return ft
+
+    def _get_target_and_pick_gw(self, data):
+        events = data['events']
+        next_gw = next((gw['id'] for gw in events if gw.get('is_next')), None)
+        current_gw = next((gw['id'] for gw in events if gw.get('is_current')), None)
+
+        if next_gw is not None:
+            pick_gw = max(1, next_gw - 1) if current_gw is None else current_gw
+            target_gw = next_gw
+        elif current_gw is not None:
+            pick_gw = current_gw
+            target_gw = current_gw
         else:
+            pick_gw = events[-1]['id']
+            target_gw = pick_gw
 
-            price_text = (
-                f"-£{abs(difference):.1f}m"
+        return target_gw, pick_gw
+
+    def _is_hard_excluded(self, p):
+        """Genuinely out regardless of how far out we're projecting: injured, suspended,
+        left the club, etc. 'doubtful' (status 'd') is handled separately since that's a
+        near-term fitness call, not a season-long exclusion."""
+        status = p.get('status', 'a')
+        return status not in ('a', 'd')
+
+    def _is_doubtful(self, p):
+        status = p.get('status', 'a')
+        if status == 'd':
+            return True
+        chance = p.get('chance_of_playing_next_round')
+        return chance is not None and chance < 100
+
+    def _availability_multiplier(self, p):
+        chance = p.get('chance_of_playing_next_round')
+        if chance is None:
+            return 0.75 if p.get('status') == 'd' else 1.0
+        return chance / 100.0
+
+    def _is_available(self, p):
+        """'Fully fit' — used for display flags (e.g. the ⚠️ Doubt tag), not for scoring."""
+        return not self._is_hard_excluded(p) and not self._is_doubtful(p)
+
+    # --- Centralized xPts Engine ---
+    def _calculate_single_gw_xpts(self, player, fixtures, target_gw, apply_doubt_penalty=True):
+        team_id = player['team']
+        base_ep = float(player.get('ep_next', 0) or 0)
+        form = float(player.get('form', 0) or 0)
+
+        if self._is_hard_excluded(player):
+            return -50.0
+
+        gw_fixtures = [f for f in fixtures if f['event'] == target_gw and (f['team_h'] == team_id or f['team_a'] == team_id)]
+
+        # Blank gameweeks yield 0 points — the player has no fixture to score in
+        if not gw_fixtures:
+            return 0.0
+
+        total_gw_score = 0.0
+        for f in gw_fixtures:
+            is_home = (f['team_h'] == team_id)
+            fdr = f['team_h_difficulty'] if is_home else f['team_a_difficulty']
+            gw_score = (base_ep * 1.8) + (form * 0.4) - (fdr * 0.7)
+            total_gw_score += max(gw_score, 0.5)
+
+        # chance_of_playing_next_round is a near-term fitness signal — only apply it when
+        # this call represents the immediate upcoming gameweek, not a future one in a horizon.
+        if apply_doubt_penalty and self._is_doubtful(player):
+            total_gw_score *= self._availability_multiplier(player)
+
+        return total_gw_score
+
+    def _calculate_horizon_xpts(self, player, fixtures, start_gw, horizon=3):
+        if self._is_hard_excluded(player):
+            return -100.0
+
+        decay_weights = [1.0, 0.85, 0.7, 0.55]
+        total_score = 0.0
+
+        for offset in range(horizon):
+            gw = start_gw + offset
+            weight = decay_weights[offset] if offset < len(decay_weights) else max(0.2, 1.0 - (offset * 0.2))
+            # Only the immediate gameweek (offset 0) gets discounted for current doubt status —
+            # a player who's 50% for this week is usually assumed fit again a few weeks out.
+            gw_score = self._calculate_single_gw_xpts(player, fixtures, gw, apply_doubt_penalty=(offset == 0))
+            total_score += (gw_score * weight)
+
+        return total_score
+
+    # --- ILP Solvers ---
+    async def _solve_best_xi(self, pool):
+        def solve():
+            if len(pool) < 11:
+                return [], []
+
+            prob = pulp.LpProblem("XI", pulp.LpMaximize)
+            start = {p['id']: pulp.LpVariable(f"s_{p['id']}", cat="Binary") for p in pool}
+            cap = {p['id']: pulp.LpVariable(f"c_{p['id']}", cat="Binary") for p in pool}
+
+            prob += pulp.lpSum(p['score'] * start[p['id']] for p in pool) + \
+                    pulp.lpSum(p['score'] * cap[p['id']] for p in pool)
+
+            prob += pulp.lpSum(start.values()) == 11
+            prob += pulp.lpSum(cap.values()) == 1
+            for p in pool:
+                prob += cap[p['id']] <= start[p['id']]
+
+            for pos, lo, hi in [(1, 1, 1), (2, 3, 5), (3, 2, 5), (4, 1, 3)]:
+                members = [p for p in pool if p['element_type'] == pos]
+                prob += pulp.lpSum(start[p['id']] for p in members) >= lo
+                prob += pulp.lpSum(start[p['id']] for p in members) <= hi
+
+            status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
+            if pulp.LpStatus[status] != "Optimal":
+                return [], []
+
+            starters, bench = [], []
+            for p in pool:
+                p['is_captain'] = pulp.value(cap[p['id']]) == 1
+                (starters if pulp.value(start[p['id']]) == 1 else bench).append(p)
+
+            non_cap = sorted([p for p in starters if not p['is_captain']], key=lambda x: x['score'], reverse=True)
+            vc_id = non_cap[0]['id'] if non_cap else None
+            for p in starters:
+                p['is_vice'] = p['id'] == vc_id
+
+            bench_gk = [p for p in bench if p['element_type'] == 1]
+            bench_out = sorted([p for p in bench if p['element_type'] != 1], key=lambda x: x['score'], reverse=True)
+            return starters, bench_gk + bench_out
+
+        return await asyncio.to_thread(solve)
+
+    async def _solve_best_15(self, candidates, budget=100.0):
+        def solve():
+            prob = pulp.LpProblem("Squad15", pulp.LpMaximize)
+            pick = {p['id']: pulp.LpVariable(f"p_{p['id']}", cat="Binary") for p in candidates}
+
+            prob += pulp.lpSum(p['score'] * pick[p['id']] for p in candidates)
+            prob += pulp.lpSum(p['cost'] * pick[p['id']] for p in candidates) <= budget
+            prob += pulp.lpSum(pick.values()) == 15
+
+            for pos, count in [(1, 2), (2, 5), (3, 5), (4, 3)]:
+                members = [p for p in candidates if p['element_type'] == pos]
+                prob += pulp.lpSum(pick[p['id']] for p in members) == count
+
+            teams = {p['team'] for p in candidates}
+            for team_id in teams:
+                members = [p for p in candidates if p['team'] == team_id]
+                prob += pulp.lpSum(pick[p['id']] for p in members) <= 3
+
+            status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
+            if pulp.LpStatus[status] != "Optimal":
+                return []
+            return [p for p in candidates if pulp.value(pick[p['id']]) == 1]
+
+        return await asyncio.to_thread(solve)
+
+    # --- Shared Squad/Candidate Pool Builder (uses pick_gw for the real squad, target_gw for horizon scoring) ---
+    async def _build_transfer_pools(self, team_id, pick_gw, target_gw, fixtures, data, horizon=3):
+        picks_data = await self._fetch_manager_gw_picks(team_id, pick_gw)
+        if not picks_data or 'picks' not in picks_data:
+            return None
+
+        players_dict = {p['id']: p for p in data['elements']}
+        bank = picks_data.get('entry_history', {}).get('bank', 0) / 10.0
+        squad_value = picks_data.get('entry_history', {}).get('value', 1000) / 10.0
+        dynamic_budget = squad_value + bank
+        owned_ids = {pick['element'] for pick in picks_data['picks']}
+
+        owned_pool = []
+        for pick in picks_data['picks']:
+            p = players_dict.get(pick['element'])
+            if not p:
+                continue
+            score = self._calculate_horizon_xpts(p, fixtures, target_gw, horizon=horizon)
+            owned_pool.append({
+                'id': p['id'], 'name': p['web_name'], 'element_type': p['element_type'],
+                'cost': p['now_cost'] / 10.0, 'team': p['team'], 'score': score,
+            })
+        if not owned_pool:
+            return None
+
+        candidates_pool = []
+        for p in data['elements']:
+            if p['id'] in owned_ids or self._is_hard_excluded(p):
+                continue
+            score = self._calculate_horizon_xpts(p, fixtures, target_gw, horizon=horizon)
+            candidates_pool.append({
+                'id': p['id'], 'name': p['web_name'], 'element_type': p['element_type'],
+                'cost': p['now_cost'] / 10.0, 'team': p['team'], 'score': score,
+            })
+
+        return {
+            "owned_pool": owned_pool,
+            "candidates_pool": candidates_pool,
+            "dynamic_budget": dynamic_budget,
+        }
+
+    # --- Multi-Transfer ILP Solver: finds the best squad reachable within `max_transfers` changes ---
+    async def _solve_transfers(self, owned_pool, candidates_pool, max_transfers, budget):
+        def solve():
+            owned_ids = {p['id'] for p in owned_pool}
+            universe = {p['id']: p for p in owned_pool}
+            for p in candidates_pool:
+                universe[p['id']] = p
+            players = list(universe.values())
+
+            prob = pulp.LpProblem("Transfers", pulp.LpMaximize)
+            x = {p['id']: pulp.LpVariable(f"x_{p['id']}", cat="Binary") for p in players}
+
+            prob += pulp.lpSum(p['score'] * x[p['id']] for p in players)
+            prob += pulp.lpSum(x.values()) == 15
+            prob += pulp.lpSum(p['cost'] * x[p['id']] for p in players) <= budget
+
+            for pos, count in [(1, 2), (2, 5), (3, 5), (4, 3)]:
+                members = [p for p in players if p['element_type'] == pos]
+                prob += pulp.lpSum(x[p['id']] for p in members) == count
+
+            teams = {p['team'] for p in players}
+            for team_id in teams:
+                members = [p for p in players if p['team'] == team_id]
+                prob += pulp.lpSum(x[p['id']] for p in members) <= 3
+
+            # At most `max_transfers` of the currently owned players may be dropped
+            prob += pulp.lpSum(x[pid] for pid in owned_ids if pid in x) >= (15 - max_transfers)
+
+            status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
+            if pulp.LpStatus[status] != "Optimal":
+                return None
+
+            final_squad = [p for p in players if pulp.value(x[p['id']]) == 1]
+            final_ids = {p['id'] for p in final_squad}
+            return {
+                "final_squad": final_squad,
+                "out": [p for p in owned_pool if p['id'] not in final_ids],
+                "in": [p for p in final_squad if p['id'] not in owned_ids],
+            }
+        return await asyncio.to_thread(solve)
+
+    # --- Live-gameweek helpers: fixture completion + automatic substitutions ---
+    @staticmethod
+    def _gw_team_fixtures(fixtures, gw):
+        """team_id -> list of this gameweek's fixtures involving that team."""
+        m = {}
+        for f in fixtures:
+            if f['event'] != gw:
+                continue
+            m.setdefault(f['team_h'], []).append(f)
+            m.setdefault(f['team_a'], []).append(f)
+        return m
+
+    @staticmethod
+    def _team_done(team_fixtures_map, team_id):
+        """True once every fixture a team has in this GW is finished — or they have
+        none at all (a blank), meaning there's nothing left to wait for."""
+        fx = team_fixtures_map.get(team_id)
+        if not fx:
+            return True
+        return all(f.get('finished') or f.get('finished_provisional') for f in fx)
+
+    def _compute_auto_subs(self, picks, players_dict, live_stats, team_fixtures_map):
+        """Simulate FPL's automatic substitutions for a live gameweek: a starter whose
+        fixture(s) are finished with 0 minutes played gets replaced by the highest-
+        priority bench player who did play, without breaking the 1 GK / >=3 DEF /
+        >=2 MID / >=1 FWD formation. A starter whose fixture hasn't finished yet is
+        left alone — they might still come on. Returns (effective_starters,
+        effective_bench, subs), where `subs` is a list of (out_element_id,
+        in_element_id) tuples in the order the swaps were made."""
+
+        def minutes_of(eid):
+            return live_stats.get(eid, {}).get('minutes', 0) or 0
+
+        def done(eid):
+            p = players_dict.get(eid)
+            return self._team_done(team_fixtures_map, p['team']) if p else True
+
+        starters = sorted([p for p in picks if p['position'] <= 11], key=lambda x: x['position'])
+        bench = sorted([p for p in picks if p['position'] > 11], key=lambda x: x['position'])
+
+        active = {p['element']: p for p in starters}
+        bench_pool = list(bench)
+        subs = []
+
+        # 1) Goalkeeper — a squad only ever carries one reserve GK, so it's a straight swap
+        starting_gk = next((p for p in starters if players_dict.get(p['element'], {}).get('element_type') == 1), None)
+        bench_gk = next((p for p in bench_pool if players_dict.get(p['element'], {}).get('element_type') == 1), None)
+        if starting_gk and bench_gk:
+            if minutes_of(starting_gk['element']) == 0 and done(starting_gk['element']) and minutes_of(bench_gk['element']) > 0:
+                del active[starting_gk['element']]
+                active[bench_gk['element']] = bench_gk
+                bench_pool.remove(bench_gk)
+                subs.append((starting_gk['element'], bench_gk['element']))
+
+        # 2) Outfield — walk the bench in the manager's set order, only accepting a
+        #    swap that keeps a legal formation.
+        def formation_counts(pool):
+            c = {2: 0, 3: 0, 4: 0}
+            for p in pool.values():
+                et = players_dict.get(p['element'], {}).get('element_type')
+                if et in c:
+                    c[et] += 1
+            return c
+
+        gk_out_id = starting_gk['element'] if starting_gk else None
+        for starter in starters:
+            eid = starter['element']
+            if eid == gk_out_id or eid not in active:
+                continue
+            if minutes_of(eid) > 0 or not done(eid):
+                continue  # played, or their fixture(s) aren't finished yet — wait and see
+
+            for cand in list(bench_pool):
+                cand_info = players_dict.get(cand['element'])
+                if not cand_info or cand_info['element_type'] == 1:
+                    continue  # bench GK never covers an outfield slot
+                if minutes_of(cand['element']) <= 0:
+                    continue  # only bring on a bench player who actually played
+
+                trial = {k: v for k, v in active.items() if k != eid}
+                trial[cand['element']] = cand
+                c = formation_counts(trial)
+                if c[2] >= 3 and c[3] >= 2 and c[4] >= 1:
+                    del active[eid]
+                    active[cand['element']] = cand
+                    bench_pool.remove(cand)
+                    subs.append((eid, cand['element']))
+                    break
+
+        return list(active.values()), bench_pool, subs
+
+    # --- Telegram Handlers ---
+    async def start(self, update: Update, context):
+        welcome_text = (
+            "⚽ **Welcome to the FPL Assistant Bot!**\n\n"
+            "**Setup & Squad:**\n"
+            "• `/setteam <ID>` - Link your FPL Team ID to the chat session\n"
+            "• `/squad` - Optimal starting XI & lineup for your linked squad\n"
+            "• `/stats` - View manager rank, points, and team value\n\n"
+            "**Transfers:**\n"
+            "• `/transfers` - Multi-week fixture transfer planner\n"
+            "• `/hits` - Point hit ROI evaluator\n"
+            "• `/scout` - Top projected point-scorers for the upcoming gameweek\n"
+            "• `/prices` - Track upcoming deadlines, risers, and fallers\n\n"
+            "**Chip Planning:**\n"
+            "• `/freehit` - Generate an optimal 15-player Free Hit squad for next GW\n"
+            "• `/bestchip` - Scan upcoming DGWs and BGWs for chip timing\n"
+            "• `/benchboost` - Simulate optimal 15-player squad for Bench Boost\n"
+            "• `/triplecaptain` - Simulate top captaincy options and fixtures\n\n"
+            "**Live & Banter:**\n"
+            "• `/live` - Real-time live score tracker\n"
+            "• `/rival <Team ID>` - Spy on and compare stats with a rival\n"
+            "• `/roast` - Deliver a real talk check on gameweek scores"
+        )
+        await update.message.reply_text(welcome_text, parse_mode="Markdown")
+
+    async def set_team(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        if not context.args:
+            await update.message.reply_text("⚠️ Please provide your FPL Team ID. Example: `/setteam 1234567`", parse_mode="Markdown")
+            return
+
+        team_id = context.args[0]
+        if not team_id.isdigit():
+            await update.message.reply_text("❌ Invalid Team ID format. It should be a number.")
+            return
+
+        manager = await self._fetch_manager_data(team_id)
+        if manager:
+            await self.db.set_team_id(chat_id, team_id)
+            name = f"{manager.get('player_first_name', '')} {manager.get('player_last_name', '')}"
+            team_name = manager.get('name', 'Unknown Team')
+            await update.message.reply_text(f"✅ Successfully linked!\n👤 **Manager:** {name}\n🛡️ **Team:** {team_name}")
+        else:
+            await update.message.reply_text("❌ Could not verify Team ID from FPL API. Please check and try again.")
+
+    async def squad(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = await self.db.get_team_id(chat_id)
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+
+        await update.message.reply_text("⏳ Evaluating optimal starting XI for the upcoming gameweek...")
+
+        data = await self._fetch_bootstrap_static()
+        fixtures = await self._fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ FPL API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+        picks_data = await self._fetch_manager_gw_picks(team_id, pick_gw)
+        if not picks_data or 'picks' not in picks_data:
+            await update.message.reply_text(f"❌ Could not retrieve your squad for GW {pick_gw}.")
+            return
+
+        players_dict = {p['id']: p for p in data['elements']}
+
+        pool = []
+        for pick in picks_data['picks']:
+            p_info = players_dict.get(pick['element'])
+            if not p_info:
+                continue
+            score = self._calculate_single_gw_xpts(p_info, fixtures, target_gw)
+            pool.append({
+                'id': p_info['id'],
+                'name': p_info['web_name'],
+                'element_type': p_info['element_type'],
+                'now_cost': p_info['now_cost'] / 10.0,
+                'available': self._is_available(p_info),
+                'score': score,
+            })
+
+        starters, bench = await self._solve_best_xi(pool)
+        if not starters:
+            await update.message.reply_text("❌ Couldn't build a valid Starting XI.")
+            return
+
+        pos_order = {1: 1, 2: 2, 3: 3, 4: 4}
+        starters.sort(key=lambda x: (pos_order[x['element_type']], -x['score']))
+        captain = next((p for p in starters if p.get('is_captain')), starters[0])
+        vice = next((p for p in starters if p.get('is_vice')), starters[1] if len(starters) > 1 else starters[0])
+
+        report = [f"⚽ **Optimal Starting XI (GW {target_gw})**\n", "🟢 **STARTING XI:**"]
+        for p in starters:
+            warn = " ⚠️ [Doubt]" if not p['available'] else ""
+            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['now_cost']}m) — xP: {p['score']:.1f}{warn}")
+
+        report.append("\n🪑 **BENCH:**")
+        for idx, p in enumerate(bench, 1):
+            report.append(f"{idx}. [{POS_NAME[p['element_type']]}] {p['name']} (£{p['now_cost']}m) — xP: {p['score']:.1f}")
+
+        report.append(f"\n⭐ **Captain:** {captain['name']}")
+        report.append(f"🥈 **Vice-Captain:** {vice['name']}")
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def free_hit(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = await self.db.get_team_id(chat_id)
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+
+        await update.message.reply_text("⚡ Generating optimal Free Hit squad for the upcoming gameweek...")
+        data = await self._fetch_bootstrap_static()
+        fixtures = await self._fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+
+        # Use actual manager squad value + bank to compute real budget limit
+        picks_data = await self._fetch_manager_gw_picks(team_id, pick_gw)
+        if picks_data and 'entry_history' in picks_data:
+            squad_value = picks_data['entry_history'].get('value', 1000) / 10.0
+            bank = picks_data['entry_history'].get('bank', 0) / 10.0
+            dynamic_budget = squad_value + bank
+        else:
+            dynamic_budget = 100.0  # Fallback
+
+        # Free Hit only lasts a single gameweek, so score purely on the upcoming GW —
+        # a multi-week horizon would reward players whose good fixtures happen AFTER
+        # the hit has already reverted.
+        candidates = []
+        for p in data['elements']:
+            if self._is_hard_excluded(p):
+                continue
+            score = self._calculate_single_gw_xpts(p, fixtures, target_gw)
+            candidates.append({
+                'id': p['id'],
+                'name': p['web_name'],
+                'element_type': p['element_type'],
+                'cost': p['now_cost'] / 10.0,
+                'team': p['team'],
+                'score': score,
+            })
+
+        squad15 = await self._solve_best_15(candidates, budget=dynamic_budget)
+        if not squad15:
+            await update.message.reply_text("❌ Couldn't build a valid Free Hit squad.")
+            return
+
+        starters, bench = await self._solve_best_xi(squad15)
+        total_cost = sum(p['cost'] for p in squad15)
+        captain = next((p for p in starters if p.get('is_captain')), None)
+
+        report = [
+            f"⚡ **Free Hit Squad (GW {target_gw})**",
+            f"💰 **Cost:** £{total_cost:.1f}m / £{dynamic_budget:.1f}m limit\n",
+            "🛡️ **Starting XI:**",
+        ]
+        for p in sorted(starters, key=lambda x: x['element_type']):
+            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m) — xP: {p['score']:.1f}")
+
+        report.append("\n🪑 **Bench:**")
+        for p in bench:
+            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m)")
+
+        if captain:
+            report.append(f"\n⭐ **Captain:** {captain['name']}")
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def transfers(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = await self.db.get_team_id(chat_id)
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+
+        n = 1
+        if context.args:
+            try:
+                n = max(1, min(int(context.args[0]), 4))
+            except ValueError:
+                await update.message.reply_text("⚠️ Usage: `/transfers` or `/transfers <1-4>`", parse_mode="Markdown")
+                return
+
+        await update.message.reply_text(f"🔄 Analyzing optimal transfer plan (up to {n})...")
+
+        data = await self._fetch_bootstrap_static()
+        fixtures = await self._fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ FPL API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+
+        history_data = await self._fetch_manager_history(team_id)
+        free_transfers = self._estimate_free_transfers(history_data, pick_gw)
+
+        pools = await self._build_transfer_pools(team_id, pick_gw, target_gw, fixtures, data)
+        if not pools:
+            await update.message.reply_text(f"❌ Could not retrieve your squad for GW {pick_gw}.")
+            return
+
+        result = await self._solve_transfers(pools['owned_pool'], pools['candidates_pool'], n, pools['dynamic_budget'])
+        if not result or not result['out']:
+            await update.message.reply_text("✅ Squad is well-optimized — no beneficial transfer found within your requested limit.")
+            return
+
+        transfers_used = len(result['out'])
+        gain = sum(p['score'] for p in result['in']) - sum(p['score'] for p in result['out'])
+
+        # Guard against recommending a change that's within model noise —
+        # require a minimum gain per transfer used, scaled by count.
+        min_gain_threshold = 1.0 * transfers_used
+        if gain < min_gain_threshold:
+            await update.message.reply_text("✅ Squad is well-optimized — no beneficial transfer found within your requested limit.")
+            return
+
+        hit_cost = max(0, transfers_used - free_transfers) * 4
+        net_gain = gain - hit_cost
+        remaining_bank = pools['dynamic_budget'] - sum(p['cost'] for p in result['final_squad'])
+
+        report = [f"🔄 **Optimal Transfer Plan — up to {n} (GW {target_gw}-{target_gw+2})**\n", "🔴 **OUT:**"]
+        for p in sorted(result['out'], key=lambda x: x['element_type']):
+            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m) — xP: {p['score']:.1f}")
+
+        report.append("\n🟢 **IN:**")
+        for p in sorted(result['in'], key=lambda x: x['element_type']):
+            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m) — xP: {p['score']:.1f}")
+
+        report.append(f"\n📊 **Transfers used:** {transfers_used} ({free_transfers} free transfer(s) banked)")
+        report.append(f"📈 **Gross projected gain:** +{gain:.1f} xP")
+        report.append(f"💰 **Bank after:** £{remaining_bank:.1f}m")
+        if transfers_used > free_transfers:
+            report.append(f"⚠️ **Hit cost:** -{hit_cost:.0f} pts ({transfers_used - free_transfers} paid transfer(s))")
+            report.append(f"📉 **Net gain after hits:** +{net_gain:.1f} xP")
+            report.append("\nℹ️ _Use `/hits` to weigh whether the extra moves are worth it over a longer horizon._")
+
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def _send_transfer_plan_report(self, update, target_gw, horizon, free_transfers, label, result, transfers_used, gain, hit_cost, net_gain):
+        report = [f"💡 **{label} — {transfers_used} transfer(s) (GW {target_gw}-{target_gw + horizon - 1})**\n", "🔴 **OUT:**"]
+        for p in sorted(result['out'], key=lambda x: x['element_type']):
+            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m) — xP: {p['score']:.1f}")
+
+        report.append("\n🟢 **IN:**")
+        for p in sorted(result['in'], key=lambda x: x['element_type']):
+            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m) — xP: {p['score']:.1f}")
+
+        report.append(f"\n📈 **Gross gain:** +{gain:.1f} xP")
+        report.append(f"🎟️ **Free transfers banked:** {free_transfers}")
+        if transfers_used > free_transfers:
+            report.append(f"⚠️ **Hit cost:** -{hit_cost:.0f} pts ({transfers_used - free_transfers} paid transfer(s))")
+            report.append(f"📉 **Net gain:** +{net_gain:.1f} xP")
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def hits(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = await self.db.get_team_id(chat_id)
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+
+        forced_n = None
+        if context.args:
+            try:
+                forced_n = max(1, min(int(context.args[0]), 4))
+            except ValueError:
+                await update.message.reply_text("⚠️ Usage: `/hits` or `/hits <1-4>`", parse_mode="Markdown")
+                return
+
+        await update.message.reply_text("💡 Running net-gain hit valuation analysis...")
+
+        data = await self._fetch_bootstrap_static()
+        fixtures = await self._fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ FPL API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+
+        history_data = await self._fetch_manager_history(team_id)
+        free_transfers = self._estimate_free_transfers(history_data, pick_gw)
+
+        # /hits weighs a -4 hit that persists beyond just the coming GW, so it looks
+        # further out than /transfers: the coming gameweek plus the next 3 (4 GWs total).
+        HORIZON = 4
+        pools = await self._build_transfer_pools(team_id, pick_gw, target_gw, fixtures, data, horizon=HORIZON)
+        if not pools:
+            await update.message.reply_text(f"❌ Could not retrieve your squad for GW {pick_gw}.")
+            return
+
+        # Thresholds: transfers within your banked free count just need to clear model
+        # noise; every transfer beyond that must independently justify itself with a real
+        # margin, since its cost (-4) is guaranteed while its gain is only an expectation.
+        FREE_THRESHOLD = 1.0
+        HIT_BUFFER = 2.0
+        caveat = (f"\n\nℹ️ _Free transfers banked is estimated at {free_transfers} from your transfer "
+                  f"history — if a recent chip wasn't detected correctly, check your FPL app's transfer count._")
+
+        if forced_n:
+            result = await self._solve_transfers(pools['owned_pool'], pools['candidates_pool'], forced_n, pools['dynamic_budget'])
+            if not result or not result['out']:
+                await update.message.reply_text(f"✅ No beneficial transfer plan found within {forced_n} transfer(s).")
+                return
+            transfers_used = len(result['out'])
+            gain = sum(p['score'] for p in result['in']) - sum(p['score'] for p in result['out'])
+            hit_cost = max(0, transfers_used - free_transfers) * 4
+            net_gain = gain - hit_cost
+            threshold = FREE_THRESHOLD if transfers_used <= free_transfers else HIT_BUFFER
+
+            if net_gain <= threshold:
+                await update.message.reply_text(
+                    f"❌ Taking {transfers_used} transfer(s) here isn't recommended — "
+                    f"projected net gain (+{net_gain:.1f} xP) doesn't clear the required margin (+{threshold:.1f} xP)."
+                    + caveat, parse_mode="Markdown"
+                )
+                return
+
+            await self._send_transfer_plan_report(update, target_gw, HORIZON, free_transfers, "Recommended Hit Plan", result, transfers_used, gain, hit_cost, net_gain)
+            return
+
+        # No count specified: explore 1–4 transfers and build a staircase of accepted upgrades,
+        # where each additional hit must clear its own marginal buffer over the current best plan.
+        scenarios = {0: {"transfers_used": 0, "gain": 0.0, "hit_cost": 0.0, "net_gain": 0.0, "result": None}}
+        for t in range(1, 5):
+            result = await self._solve_transfers(pools['owned_pool'], pools['candidates_pool'], t, pools['dynamic_budget'])
+            if not result or not result['out']:
+                continue
+            transfers_used = len(result['out'])
+            gain = sum(p['score'] for p in result['in']) - sum(p['score'] for p in result['out'])
+            hit_cost = max(0, transfers_used - free_transfers) * 4
+            net_gain = gain - hit_cost
+            scenarios[transfers_used] = {
+                "transfers_used": transfers_used, "gain": gain,
+                "hit_cost": hit_cost, "net_gain": net_gain, "result": result,
+            }
+
+        best_key = 0
+        for k in sorted(k for k in scenarios if k > 0):
+            threshold = FREE_THRESHOLD if k <= free_transfers else HIT_BUFFER
+            if scenarios[k]['net_gain'] > scenarios[best_key]['net_gain'] + threshold:
+                best_key = k
+
+        if best_key == 0:
+            await update.message.reply_text("✅ Squad is well-optimized — no transfer (free or paid) clears the value threshold this week.")
+            return
+
+        best = scenarios[best_key]
+        await self._send_transfer_plan_report(
+            update, target_gw, HORIZON, free_transfers, "Recommended Hit Plan", best['result'],
+            best['transfers_used'], best['gain'], best['hit_cost'], best['net_gain']
+        )
+        await update.message.reply_text(caveat, parse_mode="Markdown")
+
+    async def wildcard(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = await self.db.get_team_id(chat_id)
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+
+        WILDCARD_HORIZON = 6
+        await update.message.reply_text(f"🃏 Generating long-horizon Wildcard squad ({WILDCARD_HORIZON}-GW view)...")
+
+        data = await self._fetch_bootstrap_static()
+        fixtures = await self._fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+
+        picks_data = await self._fetch_manager_gw_picks(team_id, pick_gw)
+        if picks_data and 'entry_history' in picks_data:
+            squad_value = picks_data['entry_history'].get('value', 1000) / 10.0
+            bank = picks_data['entry_history'].get('bank', 0) / 10.0
+            dynamic_budget = squad_value + bank
+        else:
+            dynamic_budget = 100.0
+
+        # Unlike Free Hit, a Wildcard squad has to hold up over many weeks, so score it
+        # with the same long-horizon engine used for /hits rather than a single GW.
+        candidates = []
+        for p in data['elements']:
+            if self._is_hard_excluded(p):
+                continue
+            score = self._calculate_horizon_xpts(p, fixtures, target_gw, horizon=WILDCARD_HORIZON)
+            candidates.append({
+                'id': p['id'],
+                'name': p['web_name'],
+                'element_type': p['element_type'],
+                'cost': p['now_cost'] / 10.0,
+                'team': p['team'],
+                'score': score,
+            })
+
+        squad15 = await self._solve_best_15(candidates, budget=dynamic_budget)
+        if not squad15:
+            await update.message.reply_text("❌ Couldn't build a valid Wildcard squad.")
+            return
+
+        starters, bench = await self._solve_best_xi(squad15)
+        total_cost = sum(p['cost'] for p in squad15)
+        captain = next((p for p in starters if p.get('is_captain')), None)
+
+        report = [
+            f"🃏 **Wildcard Squad (GW {target_gw}-{target_gw + WILDCARD_HORIZON - 1})**",
+            f"💰 **Cost:** £{total_cost:.1f}m / £{dynamic_budget:.1f}m limit\n",
+            "🛡️ **Starting XI:**",
+        ]
+        for p in sorted(starters, key=lambda x: x['element_type']):
+            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m) — {WILDCARD_HORIZON}-GW xP: {p['score']:.1f}")
+
+        report.append("\n🪑 **Bench:**")
+        for p in bench:
+            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m)")
+
+        if captain:
+            report.append(f"\n⭐ **Captain:** {captain['name']}")
+        report.append(f"\nℹ️ _Scored over the next {WILDCARD_HORIZON} gameweeks since a Wildcard is a permanent rebuild, not a one-week hit._")
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def bench_boost(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = await self.db.get_team_id(chat_id)
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+
+        await update.message.reply_text("🚀 Checking bench strength across upcoming gameweeks...")
+
+        data = await self._fetch_bootstrap_static()
+        fixtures = await self._fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+        picks_data = await self._fetch_manager_gw_picks(team_id, pick_gw)
+        if not picks_data or 'picks' not in picks_data:
+            await update.message.reply_text(f"❌ Could not retrieve your squad for GW {pick_gw}.")
+            return
+
+        players_dict = {p['id']: p for p in data['elements']}
+
+        # Bench Boost only pays off if your bench actually scores — check the next few
+        # weeks rather than just this one, since a good bench week might not be now.
+        BB_LOOKAHEAD = 4
+        BB_THRESHOLD = 12.0
+        week_results = []
+        for offset in range(BB_LOOKAHEAD):
+            gw = target_gw + offset
+            pool = []
+            for pick in picks_data['picks']:
+                p_info = players_dict.get(pick['element'])
+                if not p_info:
+                    continue
+                score = self._calculate_single_gw_xpts(p_info, fixtures, gw, apply_doubt_penalty=(offset == 0))
+                pool.append({
+                    'id': p_info['id'], 'name': p_info['web_name'], 'element_type': p_info['element_type'],
+                    'now_cost': p_info['now_cost'] / 10.0, 'available': self._is_available(p_info), 'score': score,
+                })
+            starters, bench = await self._solve_best_xi(pool)
+            if not starters:
+                continue
+            bench_score = sum(p['score'] for p in bench)
+            week_results.append({'gw': gw, 'bench_score': bench_score, 'bench': bench})
+
+        if not week_results:
+            await update.message.reply_text("❌ Couldn't evaluate your bench.")
+            return
+
+        best = max(week_results, key=lambda w: w['bench_score'])
+
+        report = [f"🚀 **Bench Boost Check (GW {target_gw}-{target_gw + BB_LOOKAHEAD - 1})**\n"]
+        for w in week_results:
+            marker = " ⭐" if w['gw'] == best['gw'] else ""
+            report.append(f"• GW{w['gw']}: bench xP {w['bench_score']:.1f}{marker}")
+
+        report.append("")
+        if best['bench_score'] >= BB_THRESHOLD:
+            report.append(f"✅ **GW{best['gw']}** looks like your best Bench Boost week (bench xP {best['bench_score']:.1f}).")
+        else:
+            report.append(
+                f"⚠️ Your bench doesn't clear a strong Bench Boost bar in the next {BB_LOOKAHEAD} GWs "
+                f"(best is GW{best['gw']} at {best['bench_score']:.1f} xP) — consider strengthening bench depth first."
             )
 
-        lines.extend(
-            [
-                f"{index}. "
-                f"{player_name(outgoing)} "
-                f"➡️ "
-                f"{player_name(incoming)}",
-                f"   Projection: "
-                f"{rec['out_score']:.2f} "
-                f"➡️ {rec['in_score']:.2f}",
-                f"   Gain: +{rec['gain']:.2f}",
-                f"   Price: {price_text}",
-                "",
+        report.append(f"\n🪑 **Bench for GW{best['gw']}:**")
+        for p in sorted(best['bench'], key=lambda x: x['element_type']):
+            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} — xP: {p['score']:.1f}")
+
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def triple_captain(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = await self.db.get_team_id(chat_id)
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+
+        await update.message.reply_text("👑 Scanning captaincy ceiling across upcoming gameweeks...")
+
+        data = await self._fetch_bootstrap_static()
+        fixtures = await self._fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+        picks_data = await self._fetch_manager_gw_picks(team_id, pick_gw)
+        if not picks_data or 'picks' not in picks_data:
+            await update.message.reply_text(f"❌ Could not retrieve your squad for GW {pick_gw}.")
+            return
+
+        players_dict = {p['id']: p for p in data['elements']}
+
+        # Triple Captain wants a single explosive week for your best player, not an
+        # averaged one — scan single-GW scores rather than the horizon-discounted engine.
+        TC_LOOKAHEAD = 4
+        week_best = []
+        for offset in range(TC_LOOKAHEAD):
+            gw = target_gw + offset
+            best_player, best_score = None, float('-inf')
+            for pick in picks_data['picks']:
+                p_info = players_dict.get(pick['element'])
+                if not p_info:
+                    continue
+                score = self._calculate_single_gw_xpts(p_info, fixtures, gw, apply_doubt_penalty=(offset == 0))
+                if score > best_score:
+                    best_score, best_player = score, p_info
+            if best_player:
+                week_best.append({'gw': gw, 'name': best_player['web_name'], 'element_type': best_player['element_type'], 'score': best_score})
+
+        if not week_best:
+            await update.message.reply_text("❌ Couldn't evaluate captaincy options.")
+            return
+
+        top = max(week_best, key=lambda w: w['score'])
+
+        report = [f"👑 **Triple Captain Scan (GW {target_gw}-{target_gw + TC_LOOKAHEAD - 1})**\n"]
+        for w in week_best:
+            marker = " ⭐" if w['gw'] == top['gw'] else ""
+            report.append(f"• GW{w['gw']}: {w['name']} ({POS_NAME[w['element_type']]}) — xP: {w['score']:.1f}{marker}")
+
+        report.append(
+            f"\n✅ **Best week to play Triple Captain: GW{top['gw']}** on {top['name']} — "
+            f"the extra multiplier is worth roughly +{top['score']:.1f} xP on top of a normal captaincy."
+        )
+        report.append("\nℹ️ _This only weighs your current squad — a transfer or a newly confirmed double gameweek could change the picture closer to the week._")
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def scout(self, update: Update, context):
+        """Top projected point-scorers for the upcoming GW. Optional args: a max ownership
+        %% (e.g. `10`) to scout differentials, and/or a position (GKP/DEF/MID/FWD)."""
+        max_own = 100.0
+        pos_filter = None
+        pos_map = {'GKP': 1, 'DEF': 2, 'MID': 3, 'FWD': 4}
+        if context.args:
+            for arg in context.args:
+                if arg.upper() in pos_map:
+                    pos_filter = pos_map[arg.upper()]
+                    continue
+                try:
+                    max_own = float(arg)
+                except ValueError:
+                    pass
+
+        await update.message.reply_text("🔭 Scouting top projected scorers for the upcoming gameweek...")
+
+        data = await self._fetch_bootstrap_static()
+        fixtures = await self._fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+
+        candidates = []
+        for p in data['elements']:
+            if self._is_hard_excluded(p):
+                continue
+            if pos_filter and p['element_type'] != pos_filter:
+                continue
+            try:
+                owned_pct = float(p.get('selected_by_percent', '0') or 0)
+            except (TypeError, ValueError):
+                owned_pct = 0.0
+            if owned_pct > max_own:
+                continue
+            score = self._calculate_single_gw_xpts(p, fixtures, target_gw)
+            if score <= 0:
+                continue
+            candidates.append({
+                'id': p['id'], 'name': p['web_name'], 'element_type': p['element_type'],
+                'cost': p['now_cost'] / 10.0, 'owned_pct': owned_pct, 'score': score,
+            })
+
+        if not candidates:
+            await update.message.reply_text("❌ No players found matching those filters.")
+            return
+
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+        header = f"🔭 **Top Scouted Picks (GW {target_gw})**"
+        if max_own < 100:
+            header += f" — <{max_own:.0f}% owned"
+        report = [header + "\n"]
+        for p in candidates[:10]:
+            report.append(f"• [{POS_NAME[p['element_type']]}] {p['name']} (£{p['cost']}m, {p['owned_pct']:.1f}% owned) — xP: {p['score']:.1f}")
+
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def stats(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = await self.db.get_team_id(chat_id)
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+
+        await update.message.reply_text("📈 Pulling your manager profile...")
+
+        data = await self._fetch_bootstrap_static()
+        if not data:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+        manager = await self._fetch_manager_data(team_id)
+        if not manager:
+            await update.message.reply_text("❌ Couldn't fetch your manager profile.")
+            return
+
+        picks_data = await self._fetch_manager_gw_picks(team_id, pick_gw)
+        gw_points = picks_data.get('entry_history', {}).get('points') if picks_data else None
+        gw_rank = picks_data.get('entry_history', {}).get('rank') if picks_data else None
+        bank = (manager.get('last_deadline_bank', 0) or 0) / 10.0
+        value = (manager.get('last_deadline_value', 0) or 0) / 10.0
+
+        name = f"{manager.get('player_first_name', '')} {manager.get('player_last_name', '')}".strip()
+        team_name = manager.get('name', 'Unknown Team')
+
+        report = [
+            f"📈 **{team_name}**",
+            f"👤 {name}\n",
+            f"🏆 **Overall Rank:** {self._fmt_rank(manager.get('summary_overall_rank'))}",
+            f"📊 **Overall Points:** {manager.get('summary_overall_points', '—')}",
+            f"📅 **GW{pick_gw} Points:** {gw_points if gw_points is not None else '—'}"
+            + (f" (rank {self._fmt_rank(gw_rank)})" if gw_rank else ""),
+            f"💰 **Team Value:** £{value:.1f}m",
+            f"🏦 **Bank:** £{bank:.1f}m",
+        ]
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def best_chip(self, update: Update, context):
+        await update.message.reply_text("🔮 Scanning fixture list for double and blank gameweeks...")
+
+        data = await self._fetch_bootstrap_static()
+        fixtures = await self._fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+        all_team_ids = {t['id'] for t in data['teams']}
+
+        LOOKAHEAD = 8
+        dgw_report, bgw_report = [], []
+        for offset in range(LOOKAHEAD):
+            gw = target_gw + offset
+            gw_fixtures = [f for f in fixtures if f['event'] == gw]
+            if not gw_fixtures:
+                continue  # not yet scheduled — don't misreport as a blank
+
+            team_counts = {}
+            for f in gw_fixtures:
+                team_counts[f['team_h']] = team_counts.get(f['team_h'], 0) + 1
+                team_counts[f['team_a']] = team_counts.get(f['team_a'], 0) + 1
+
+            dgw_teams = [t for t, c in team_counts.items() if c >= 2]
+            bgw_teams = [t for t in all_team_ids if team_counts.get(t, 0) == 0]
+            if dgw_teams:
+                dgw_report.append((gw, len(dgw_teams)))
+            if bgw_teams:
+                bgw_report.append((gw, len(bgw_teams)))
+
+        report = [f"🔮 **Chip Timing Scan (GW {target_gw}-{target_gw + LOOKAHEAD - 1})**\n"]
+        if dgw_report:
+            report.append("⚡ **Double Gameweeks:**")
+            for gw, count in dgw_report:
+                report.append(f"• GW{gw}: {count} team(s) with 2 fixtures")
+        else:
+            report.append("⚡ No confirmed double gameweeks in this window yet.")
+
+        report.append("")
+        if bgw_report:
+            report.append("🚫 **Blank Gameweeks:**")
+            for gw, count in bgw_report:
+                report.append(f"• GW{gw}: {count} team(s) with no fixture")
+        else:
+            report.append("🚫 No confirmed blank gameweeks in this window yet.")
+
+        report.append("")
+        if dgw_report:
+            best_dgw = max(dgw_report, key=lambda x: x[1])
+            report.append(f"💡 **GW{best_dgw[0]}** looks like the strongest week for Bench Boost / Triple Captain ({best_dgw[1]} teams with a double).")
+        if bgw_report:
+            best_bgw = max(bgw_report, key=lambda x: x[1])
+            report.append(f"💡 **GW{best_bgw[0]}** looks like a candidate for Free Hit ({best_bgw[1]} teams blank).")
+
+        report.append("\nℹ️ _Fixture schedules can change (postponements, rearrangements) — always confirm close to the deadline._")
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def live(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = await self.db.get_team_id(chat_id)
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+
+        data = await self._fetch_bootstrap_static()
+        fixtures = await self._fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        # Prefer the currently in-progress/most recent GW, not the upcoming one
+        live_gw = next((gw['id'] for gw in data['events'] if gw.get('is_current')), None)
+        if live_gw is None:
+            _, live_gw = self._get_target_and_pick_gw(data)
+
+        picks_data, live_data = await asyncio.gather(
+            self._fetch_manager_gw_picks(team_id, live_gw),
+            self._fetch_live_event(live_gw),
+        )
+        if not picks_data or 'picks' not in picks_data or not live_data:
+            await update.message.reply_text(f"❌ Couldn't retrieve live data for GW {live_gw}.")
+            return
+
+        live_stats = {el['id']: el.get('stats', {}) for el in live_data.get('elements', [])}
+        players_dict = {p['id']: p for p in data['elements']}
+        team_fixtures_map = self._gw_team_fixtures(fixtures, live_gw)
+
+        # Simulate FPL's automatic substitutions: a starter stuck on 0 minutes once
+        # their fixture(s) are finished gets swapped for the best bench player who
+        # actually played, same as the official scoring does after the fact.
+        effective_starters, _, subs = self._compute_auto_subs(
+            picks_data['picks'], players_dict, live_stats, team_fixtures_map
+        )
+        effective_ids = {p['element'] for p in effective_starters}
+        subbed_out_ids = {out_id for out_id, _ in subs}
+        subbed_in_ids = {in_id for _, in_id in subs}
+
+        # Captain armband: if the captain got 0 minutes in a now-finished fixture,
+        # the multiplier passes to the vice-captain — the same rule FPL applies itself.
+        captain_pick = next((p for p in picks_data['picks'] if p.get('is_captain')), None)
+        vice_pick = next((p for p in picks_data['picks'] if p.get('is_vice_captain')), None)
+        armband_id = captain_pick['element'] if captain_pick else None
+        if captain_pick and vice_pick and players_dict.get(captain_pick['element']):
+            cap_mins = live_stats.get(captain_pick['element'], {}).get('minutes', 0) or 0
+            cap_team = players_dict[captain_pick['element']]['team']
+            if cap_mins == 0 and self._team_done(team_fixtures_map, cap_team):
+                armband_id = vice_pick['element']
+
+        total_points = 0
+        lines = []
+        for pick in sorted(picks_data['picks'], key=lambda x: x['position']):
+            p_info = players_dict.get(pick['element'])
+            if not p_info:
+                continue
+            pts = live_stats.get(pick['element'], {}).get('total_points', 0)
+            in_xi = pick['element'] in effective_ids
+
+            if not in_xi:
+                mult = 0
+            elif pick['element'] == armband_id:
+                # Own multiplier covers the captain (incl. Triple Captain) when they
+                # played; a fallback to the vice-captain is always a standard double.
+                mult = pick['multiplier'] if pick.get('is_captain') else 2
+            else:
+                mult = 1
+            total_points += pts * mult
+
+            tag = " (C)" if pick.get('is_captain') else (" (VC)" if pick.get('is_vice_captain') else "")
+            if pick['element'] in subbed_out_ids:
+                status = " [Subbed out]"
+            elif pick['element'] in subbed_in_ids:
+                status = " [Auto-sub]"
+            elif not in_xi:
+                status = " [Bench]"
+            else:
+                status = ""
+            mult_tag = f" x{mult}" if mult > 1 else ""
+            lines.append(f"• {p_info['web_name']}{tag}{status}: {pts} pts{mult_tag}")
+
+        report = [f"📡 **Live Score — GW{live_gw}**\n", f"🏆 **Total:** {total_points} pts\n", *lines]
+        if subs:
+            report.append("\n🔁 _Auto-subs applied above for starters who finished on 0 minutes._")
+        if vice_pick and armband_id == vice_pick['element']:
+            vice_name = players_dict.get(vice_pick['element'], {}).get('web_name', 'your vice-captain')
+            report.append(f"👑 _Captain blanked — armband passed to {vice_name}._")
+        report.append("\nℹ️ _Refresh with `/live` — this bot doesn't push updates automatically._")
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def prices(self, update: Update, context):
+        await update.message.reply_text("💹 Checking deadline and price movement signals...")
+
+        data = await self._fetch_bootstrap_static()
+        if not data:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        next_event = next((e for e in data['events'] if e.get('is_next')), None)
+        deadline_line = "⏰ No upcoming deadline found."
+        if next_event:
+            try:
+                dt = datetime.fromisoformat(next_event['deadline_time'].replace('Z', '+00:00'))
+                deadline_line = f"⏰ **Next Deadline (GW{next_event['id']}):** {dt.strftime('%a %d %b, %H:%M UTC')}"
+            except (ValueError, KeyError):
+                deadline_line = f"⏰ **Next Deadline (GW{next_event['id']}):** {next_event.get('deadline_time', '—')}"
+
+        elements = data['elements']
+        already_changed = sorted(
+            (p for p in elements if p.get('cost_change_event', 0) != 0),
+            key=lambda p: abs(p['cost_change_event']), reverse=True
+        )
+        by_net = sorted(elements, key=lambda p: p.get('transfers_in_event', 0) - p.get('transfers_out_event', 0), reverse=True)
+        risers = [p for p in by_net if (p.get('transfers_in_event', 0) - p.get('transfers_out_event', 0)) > 0][:5]
+        fallers = list(reversed([p for p in by_net if (p.get('transfers_in_event', 0) - p.get('transfers_out_event', 0)) < 0]))[:5]
+
+        report = [f"💹 **Price Watch**\n", deadline_line, ""]
+        if already_changed:
+            report.append("📊 **Already changed today:**")
+            for p in already_changed[:8]:
+                direction = "🔼" if p['cost_change_event'] > 0 else "🔽"
+                report.append(f"{direction} {p['web_name']}: £{p['now_cost']/10:.1f}m ({p['cost_change_event']/10:+.1f})")
+            report.append("")
+
+        if risers:
+            report.append("📈 **Likely risers tonight (net transfers in):**")
+            for p in risers:
+                net = p.get('transfers_in_event', 0) - p.get('transfers_out_event', 0)
+                report.append(f"• {p['web_name']} (£{p['now_cost']/10:.1f}m) — net +{net:,}")
+            report.append("")
+
+        if fallers:
+            report.append("📉 **Likely fallers tonight (net transfers out):**")
+            for p in fallers:
+                net = p.get('transfers_in_event', 0) - p.get('transfers_out_event', 0)
+                report.append(f"• {p['web_name']} (£{p['now_cost']/10:.1f}m) — net {net:,}")
+
+        report.append("\nℹ️ _Net transfer volume is a signal, not a guarantee — actual changes depend on FPL's internal algorithm._")
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
+
+    async def rival(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = await self.db.get_team_id(chat_id)
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
+        if not context.args or not context.args[0].isdigit():
+            await update.message.reply_text("⚠️ Usage: `/rival <Team ID>`", parse_mode="Markdown")
+            return
+        rival_id = context.args[0]
+
+        await update.message.reply_text("🕵️ Spying on rival squad...")
+
+        data = await self._fetch_bootstrap_static()
+        fixtures = await self._fetch_fixtures()
+        if not data or not fixtures:
+            await update.message.reply_text("❌ API unreachable.")
+            return
+
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+
+        my_manager, rival_manager = await asyncio.gather(
+            self._fetch_manager_data(team_id), self._fetch_manager_data(rival_id)
+        )
+        if not my_manager or not rival_manager:
+            await update.message.reply_text("❌ Couldn't fetch one of the team profiles — check the rival Team ID.")
+            return
+
+        my_picks, rival_picks = await asyncio.gather(
+            self._fetch_manager_gw_picks(team_id, pick_gw), self._fetch_manager_gw_picks(rival_id, pick_gw)
+        )
+
+        players_dict = {p['id']: p for p in data['elements']}
+
+        def projected_total(picks_data):
+            if not picks_data or 'picks' not in picks_data:
+                return None
+            total = 0.0
+            for pick in picks_data['picks']:
+                if pick['position'] > 11:
+                    continue
+                p_info = players_dict.get(pick['element'])
+                if not p_info:
+                    continue
+                total += self._calculate_single_gw_xpts(p_info, fixtures, target_gw) * pick['multiplier']
+            return total
+
+        my_proj = projected_total(my_picks)
+        rival_proj = projected_total(rival_picks)
+
+        def profile_block(label, manager, proj):
+            name = f"{manager.get('player_first_name', '')} {manager.get('player_last_name', '')}".strip()
+            lines = [
+                f"{label} — **{manager.get('name', 'Unknown Team')}** ({name})",
+                f"🏆 Rank: {self._fmt_rank(manager.get('summary_overall_rank'))} | 📊 Points: {manager.get('summary_overall_points', '—')}",
+                f"💰 Value: £{(manager.get('last_deadline_value', 0) or 0) / 10:.1f}m",
             ]
-        )
+            if proj is not None:
+                lines.append(f"🔮 Projected GW{target_gw}: {proj:.1f} pts")
+            return lines
 
-    await message.reply_text(
-        "\n".join(lines)
-    )
+        report = ["🕵️ **Rival Check**\n"]
+        report += profile_block("👤 You", my_manager, my_proj)
+        report.append("")
+        report += profile_block("🎯 Rival", rival_manager, rival_proj)
 
+        if my_proj is not None and rival_proj is not None:
+            diff = my_proj - rival_proj
+            if diff > 0.5:
+                report.append(f"\n✅ You're projected to win this GW by {diff:.1f} pts.")
+            elif diff < -0.5:
+                report.append(f"\n⚠️ Rival is projected to outscore you by {-diff:.1f} pts.")
+            else:
+                report.append("\n🤝 Dead even on projection.")
 
-# ============================================================
-# REGISTER COMMANDS
-# ============================================================
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
 
-application.add_handler(
-    CommandHandler(
-        "start",
-        start_command
-    )
-)
+    async def roast(self, update: Update, context):
+        chat_id = update.effective_chat.id
+        team_id = await self.db.get_team_id(chat_id)
+        if not team_id:
+            await update.message.reply_text("⚠️ Please link your FPL team first using `/setteam <ID>`", parse_mode="Markdown")
+            return
 
-application.add_handler(
-    CommandHandler(
-        "help",
-        help_command
-    )
-)
+        await update.message.reply_text("🔥 Pulling up the tape...")
 
-application.add_handler(
-    CommandHandler(
-        "team",
-        team_command
-    )
-)
+        data = await self._fetch_bootstrap_static()
+        if not data:
+            await update.message.reply_text("❌ API unreachable.")
+            return
 
-application.add_handler(
-    CommandHandler(
-        "myteam",
-        myteam_command
-    )
-)
+        target_gw, pick_gw = self._get_target_and_pick_gw(data)
+        event = next((e for e in data['events'] if e['id'] == pick_gw), None)
+        avg_score = event.get('average_entry_score') if event else None
+        highest_score = event.get('highest_score') if event else None
 
-application.add_handler(
-    CommandHandler(
-        "xi",
-        xi_command
-    )
-)
+        picks_data = await self._fetch_manager_gw_picks(team_id, pick_gw)
+        my_score = picks_data.get('entry_history', {}).get('points') if picks_data else None
 
-application.add_handler(
-    CommandHandler(
-        "freehit",
-        freehit_command
-    )
-)
+        if my_score is None or not avg_score:
+            await update.message.reply_text("❌ No completed gameweek score to roast yet — check back after kickoff.")
+            return
 
-application.add_handler(
-    CommandHandler(
-        "transfers",
-        transfers_command
-    )
-)
+        diff = my_score - avg_score
+        report = [f"🔥 **GW{pick_gw} Real Talk**\n", f"Your score: **{my_score}** pts", f"Average: {avg_score} pts"]
+        if highest_score:
+            report.append(f"Highest: {highest_score} pts")
+        report.append("")
 
+        if diff >= 20:
+            line = "Absolutely cooked the average. Screenshot this before it regresses to the mean."
+        elif diff >= 8:
+            line = "Solidly above the pack. Not bragging rights yet, but you're allowed a small smile."
+        elif diff > -3:
+            line = "Right around the average — the FPL equivalent of a shrug emoji."
+        elif diff > -15:
+            line = "Below the curve. The captain pick is probably the first suspect."
+        else:
+            line = "Rough week. This is the kind of scoreline that ends in a Wildcard by Thursday."
+        report.append(f"_{line}_")
 
-# ============================================================
-# TELEGRAM BACKGROUND LOOP
-# ============================================================
-
-async def telegram_main():
-
-    global ptb_loop
-
-    ptb_loop = asyncio.get_running_loop()
-
-    logger.info(
-        "Initializing Telegram application..."
-    )
-
-    await application.initialize()
-
-    await application.start()
-
-    # Set Telegram webhook.
-    webhook_url = WEBHOOK_URL.rstrip(
-        "/"
-    )
-
-    if webhook_url:
-
-        try:
-
-            await application.bot.set_webhook(
-                url=webhook_url,
-                secret_token=(
-                    WEBHOOK_SECRET
-                    if WEBHOOK_SECRET
-                    else None
-                ),
-                allowed_updates=[
-                    "message",
-                    "callback_query",
-                ],
-            )
-
-            logger.info(
-                "Telegram webhook configured: %s",
-                webhook_url
-            )
-
-        except Exception as exc:
-
-            logger.exception(
-                "Unable to configure Telegram webhook: %s",
-                exc
-            )
-
-    logger.info(
-        "Telegram application started."
-    )
-
-    # Keep the asyncio loop alive.
-    await asyncio.Event().wait()
+        await update.message.reply_text("\n".join(report), parse_mode="Markdown")
 
 
-def run_telegram_loop():
+BOT_COMMANDS = [
+    ("start", "Launch the FPL Assistant and view the main menu"),
+    ("setteam", "Link your FPL Team ID to the chat session"),
+    ("squad", "Optimal starting XI & lineup for your linked squad"),
+    ("freehit", "Generate an optimal 15-player Free Hit squad for next GW"),
+    ("scout", "Top projected point-scorers for the upcoming gameweek"),
+    ("stats", "View manager rank, points, and team value"),
+    ("transfers", "Multi-week fixture transfer planner"),
+    ("hits", "Point hit ROI evaluator"),
+    ("bestchip", "Scan upcoming DGWs and BGWs for chip timing"),
+    ("benchboost", "Simulate optimal 15-player squad for Bench Boost"),
+    ("triplecaptain", "Simulate top captaincy options and fixtures"),
+    ("live", "Real-time live score tracker"),
+    ("prices", "Track upcoming deadlines, risers, and fallers"),
+    ("rival", "Spy on and compare stats with a rival"),
+    ("roast", "Deliver a real talk check on gameweek scores"),
+]
 
-    global ptb_loop
 
-    try:
-
-        asyncio.run(
-            telegram_main()
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Telegram background loop stopped."
-        )
+async def _post_init(application: Application):
+    # Registers the exact command menu Telegram shows in the "/" autocomplete picker.
+    await application.bot.set_my_commands([BotCommand(cmd, desc) for cmd, desc in BOT_COMMANDS])
 
 
-def start_telegram_thread():
-
-    global ptb_thread
-
-    if ptb_thread is not None:
+def start_telegram_bot():
+    BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN environment variable is missing!")
         return
 
-    ptb_thread = threading.Thread(
-        target=run_telegram_loop,
-        daemon=True
-    )
+    bot_instance = FPLBot()
+    application = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
 
-    ptb_thread.start()
+    application.add_handler(CommandHandler("start", bot_instance.start))
+    application.add_handler(CommandHandler("setteam", bot_instance.set_team))
+    application.add_handler(CommandHandler("squad", bot_instance.squad))
+    application.add_handler(CommandHandler("freehit", bot_instance.free_hit))
+    application.add_handler(CommandHandler("scout", bot_instance.scout))
+    application.add_handler(CommandHandler("stats", bot_instance.stats))
+    application.add_handler(CommandHandler("transfers", bot_instance.transfers))
+    application.add_handler(CommandHandler("hits", bot_instance.hits))
+    application.add_handler(CommandHandler("bestchip", bot_instance.best_chip))
+    application.add_handler(CommandHandler("benchboost", bot_instance.bench_boost))
+    application.add_handler(CommandHandler("triplecaptain", bot_instance.triple_captain))
+    application.add_handler(CommandHandler("live", bot_instance.live))
+    application.add_handler(CommandHandler("prices", bot_instance.prices))
+    application.add_handler(CommandHandler("rival", bot_instance.rival))
+    application.add_handler(CommandHandler("roast", bot_instance.roast))
+    # Kept working but left off the Telegram menu since it wasn't in the requested list:
+    application.add_handler(CommandHandler("wildcard", bot_instance.wildcard))
 
-    # Give the Telegram loop a moment to initialize.
-    time.sleep(2)
+    logger.info("Starting FPL Telegram Bot via Polling...")
+    application.run_polling()
 
-
-# ============================================================
-# FLASK ROUTES
-# ============================================================
-
-@app.get("/")
-def home():
-
-    return jsonify(
-        {
-            "status": "online",
-            "service": "FPL Tactical Assistant",
-        }
-    )
-
-
-@app.get("/health")
-def health():
-
-    return jsonify(
-        {
-            "status": "healthy",
-            "telegram": bool(TOKEN),
-        }
-    )
-
-
-@app.post("/webhook")
-def telegram_webhook():
-
-    global ptb_loop
-
-    # Validate Telegram secret when configured.
-    if WEBHOOK_SECRET:
-
-        supplied_secret = request.headers.get(
-            "X-Telegram-Bot-Api-Secret-Token",
-            ""
-        )
-
-        if supplied_secret != WEBHOOK_SECRET:
-
-            logger.warning(
-                "Rejected webhook request with invalid secret."
-            )
-
-            return jsonify(
-                {
-                    "ok": False,
-                    "error": "Unauthorized",
-                }
-            ), 403
-
-    if ptb_loop is None:
-
-        logger.error(
-            "Telegram event loop is not ready."
-        )
-
-        return jsonify(
-            {
-                "ok": False,
-                "error": "Telegram not ready",
-            }
-        ), 503
-
-    try:
-
-        data = request.get_json(
-            force=True
-        )
-
-        update = Update.de_json(
-            data,
-            application.bot
-        )
-
-        future = asyncio.run_coroutine_threadsafe(
-            application.update_queue.put(
-                update
-            ),
-            ptb_loop
-        )
-
-        future.result(
-            timeout=5
-        )
-
-        return jsonify(
-            {
-                "ok": True
-            }
-        )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Webhook processing failed: %s",
-            exc
-        )
-
-        return jsonify(
-            {
-                "ok": False,
-                "error": str(exc),
-            }
-        ), 500
-
-
-# ============================================================
-# ERROR HANDLERS
-# ============================================================
-
-@app.errorhandler(404)
-def not_found(error):
-
-    return jsonify(
-        {
-            "ok": False,
-            "error": "Not found",
-        }
-    ), 404
-
-
-@app.errorhandler(500)
-def internal_error(error):
-
-    logger.exception(
-        "Internal server error: %s",
-        error
-    )
-
-    return jsonify(
-        {
-            "ok": False,
-            "error": "Internal server error",
-        }
-    ), 500
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-def startup():
-
-    logger.info(
-        "Starting FPL Tactical Assistant..."
-    )
-
-    if not TOKEN:
-
-        logger.warning(
-            "TELEGRAM_BOT_TOKEN is missing. "
-            "Telegram functionality will not work."
-        )
-
-        return
-
-    start_telegram_thread()
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-startup()
-
-
+# --- Execution Entry Point ---
 if __name__ == "__main__":
+    web_thread = Thread(target=run_web)
+    web_thread.daemon = True
+    web_thread.start()
+    logger.info("Background Flask health check server started.")
 
-    app.run(
-        host="0.0.0.0",
-        port=PORT,
-        debug=False
-    )
+    start_telegram_bot()
