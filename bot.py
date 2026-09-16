@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://fpl-telegram-bot-63un.onrender.com/webhook")
+WEBHOOK_URL = "https://fpl-telegram-bot-63un.onrender.com/webhook"
 # Optional but recommended: set this in your Render env vars. When set, the webhook
 # route rejects any POST that doesn't carry Telegram's matching secret header, so a
 # stranger who finds your URL can't feed the bot fake updates.
